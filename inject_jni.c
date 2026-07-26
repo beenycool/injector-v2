@@ -323,10 +323,30 @@ static void *injection_worker(void *arg) {
     }
 
     // ── Phase 4: find Minecraft class via thread context classloader ─────
+    //
+    // The JVM starts before Minecraft's classes are loaded.  Poll until the
+    // class appears (or timeout).  Each attempt gets a fresh JNIEnv* since
+    // the classloader may not be fully initialized yet.
 
     log_write("Looking up net.minecraft.client.Minecraft via context classloader...");
-    jclass mc_class = find_class_with_thread_loader(
-        env, "net.minecraft.client.Minecraft");
+    jclass mc_class = NULL;
+    attempts = 0;
+
+    while (attempts < max_attempts) {
+        // Need a fresh env each attempt because JNI local refs accumulate
+        JNIEnv *env = attach_to_jvm(jvm);
+        if (env) {
+            mc_class = find_class_with_thread_loader(
+                env, "net.minecraft.client.Minecraft");
+            if (mc_class != NULL) {
+                // Promote to global ref so it survives env cleanup
+                mc_class = (jclass)(*env)->NewGlobalRef(env, mc_class);
+                break;
+            }
+        }
+        attempts++;
+        usleep(500000);
+    }
 
     // ── Phase 5: write result ────────────────────────────────────────────
 
