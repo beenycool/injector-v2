@@ -101,7 +101,7 @@ if [ "$NO_INJECT" = false ]; then
       --workingDirectory . \
       --classpathDir /Users/soodies/.lunarclient/offline/multiver \
       --width 1280 --height 720 \
-      "${PASSTHROUGH_ARGS[@]}"
+      "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"
 
     # After Lunar exits, show the injection results
     echo ""
@@ -151,5 +151,5 @@ else
       --workingDirectory . \
       --classpathDir /Users/soodies/.lunarclient/offline/multiver \
       --width 1280 --height 720 \
-      "${PASSTHROUGH_ARGS[@]}"
+      "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"
 fi
