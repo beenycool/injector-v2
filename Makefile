@@ -17,7 +17,13 @@ SRC          = inject_jni.c
 # ── JDK / JNI paths ─────────────────────────────────────────────────────────
 # Adjust JAVA_HOME if your JDK is elsewhere.
 JAVA_HOME   ?= /opt/homebrew/opt/openjdk@17
-JNI_INCLUDE  = -I$(JAVA_HOME)/include -I$(JAVA_HOME)/include/darwin
+UNAME_S     := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+  JNI_OS_INC  = $(JAVA_HOME)/include/darwin
+else
+  JNI_OS_INC  = $(JAVA_HOME)/include/linux
+endif
+JNI_INCLUDE  = -I$(JAVA_HOME)/include -I$(JNI_OS_INC)
 
 # ── Compiler flags ──────────────────────────────────────────────────────────
 CC           = clang
@@ -73,6 +79,7 @@ help:
 	@echo "  make sign    — ad-hoc sign the dylib"
 	@echo "  make all     — build + sign (default)"
 	@echo "  make check   — show architecture & signature info"
+	@echo "  make test-syntax — compile-only syntax check (cross-platform CI)"
 	@echo "  make clean   — remove build artifacts"
 	@echo ""
 	@echo "Variables:"
