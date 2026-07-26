@@ -235,57 +235,49 @@ static void *injection_worker(void *arg) {
 
     log_write("=== inject_jni worker thread started ===");
 
-    // ── Phase 1: locate libjvm.dylib ─────────────────────────────────────
+    // ── Phase 1: locate JNI_GetCreatedJavaVMs symbol ────────────────────
+    //
+    // We can NOT dlopen("libjvm.dylib", RTLD_NOLOAD) — on macOS the Zulu JRE
+    // loads libjvm from a bundled path inside ~/.lunarclient/jre/..., and
+    // dlopen with just a leaf name can't find it even with RTLD_NOLOAD.
+    //
+    // Instead, poll dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs").  RTLD_DEFAULT
+    // searches every already-loaded image in the process (including libjvm),
+    // so this works regardless of where libjvm.dylib lives on disk.
+    //
     // The dylib constructor runs before main(), so libjvm may not be loaded
-    // yet.  Poll with dlopen(RTLD_NOLOAD) until it appears.
+    // yet.  Poll until the symbol appears.
 
-    void *jvm_lib = NULL;
+    typedef jint (*JNI_GetCreatedJavaVMs_t)(JavaVM **, jsize, jsize *);
+    JNI_GetCreatedJavaVMs_t JNI_GetCreatedJavaVMs_ptr = NULL;
     int attempts = 0;
     const int max_attempts = 120;  // ~60 seconds with 500ms sleep
 
-    log_write("Waiting for libjvm.dylib to be loaded...");
+    log_write("Waiting for JNI_GetCreatedJavaVMs (JVM startup)...");
 
     while (attempts < max_attempts) {
-        jvm_lib = dlopen("libjvm.dylib", RTLD_NOLOAD);
-        if (jvm_lib != NULL) break;
+        JNI_GetCreatedJavaVMs_ptr =
+            (JNI_GetCreatedJavaVMs_t)dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
+        if (JNI_GetCreatedJavaVMs_ptr != NULL) break;
         attempts++;
-        usleep(500000);  // 500 ms
+        usleep(500000);
     }
-
-    if (jvm_lib == NULL) {
-        log_write("ERROR: libjvm.dylib not loaded after timeout");
-        FILE *f = fopen(RESULT_PATH, "w");
-        if (f) {
-            fprintf(f, "ERROR: libjvm.dylib was never loaded\n");
-            fclose(f);
-        }
-        log_close();
-        return NULL;
-    }
-
-    log_write("Found libjvm.dylib (already loaded)");
-
-    // ── Phase 2: get JNI_GetCreatedJavaVMs ───────────────────────────────
-
-    typedef jint (*JNI_GetCreatedJavaVMs_t)(JavaVM **, jsize, jsize *);
-    JNI_GetCreatedJavaVMs_t JNI_GetCreatedJavaVMs_ptr =
-        (JNI_GetCreatedJavaVMs_t)dlsym(jvm_lib, "JNI_GetCreatedJavaVMs");
 
     if (!JNI_GetCreatedJavaVMs_ptr) {
-        log_write("ERROR: dlsym(JNI_GetCreatedJavaVMs) failed");
+        log_write("ERROR: JNI_GetCreatedJavaVMs not found after timeout");
         log_write(dlerror());
         FILE *f = fopen(RESULT_PATH, "w");
         if (f) {
-            fprintf(f, "ERROR: JNI_GetCreatedJavaVMs symbol not found\n");
+            fprintf(f, "ERROR: JNI_GetCreatedJavaVMs symbol never appeared\n");
             fclose(f);
         }
         log_close();
         return NULL;
     }
 
-    log_write("Found JNI_GetCreatedJavaVMs symbol");
+    log_write("Found JNI_GetCreatedJavaVMs symbol via RTLD_DEFAULT");
 
-    // ── Phase 3: wait for JVM to be created ──────────────────────────────
+    // ── Phase 2: wait for JVM to be created ──────────────────────────────
 
     JavaVM *jvm = NULL;
     jsize n_vms = 0;
@@ -317,7 +309,7 @@ static void *injection_worker(void *arg) {
         log_write(buf);
     }
 
-    // ── Phase 4: attach current thread to JVM ────────────────────────────
+    // ── Phase 3: attach current thread to JVM ────────────────────────────
 
     JNIEnv *env = attach_to_jvm(jvm);
     if (!env) {
@@ -330,13 +322,13 @@ static void *injection_worker(void *arg) {
         return NULL;
     }
 
-    // ── Phase 5: find Minecraft class via thread context classloader ─────
+    // ── Phase 4: find Minecraft class via thread context classloader ─────
 
     log_write("Looking up net.minecraft.client.Minecraft via context classloader...");
     jclass mc_class = find_class_with_thread_loader(
         env, "net.minecraft.client.Minecraft");
 
-    // ── Phase 6: write result ────────────────────────────────────────────
+    // ── Phase 5: write result ────────────────────────────────────────────
 
     FILE *f = fopen(RESULT_PATH, "w");
     if (f) {
