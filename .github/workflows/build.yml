@@ -1,0 +1,62 @@
+name: Build inject_jni.dylib
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest  # Apple Silicon (arm64)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Compile dylib
+        run: |
+          JAVA_HOME="${JAVA_HOME:-$(/usr/libexec/java_home -v 17)}"
+          echo "JAVA_HOME=$JAVA_HOME"
+
+          clang -dynamiclib \
+            -Wall -Wextra -O2 \
+            -I"$JAVA_HOME/include" \
+            -I"$JAVA_HOME/include/darwin" \
+            -o inject_jni.dylib \
+            inject_jni.c \
+            -framework JavaVM
+
+          echo "Build successful."
+
+      - name: Ad-hoc sign
+        run: |
+          codesign --force --sign - inject_jni.dylib
+          echo "Signed with ad-hoc signature."
+
+      - name: Verify
+        run: |
+          echo "=== Architecture ==="
+          lipo -info inject_jni.dylib
+          echo ""
+          echo "=== Signature ==="
+          codesign -dv inject_jni.dylib 2>&1 || true
+          echo ""
+          echo "=== Dependencies ==="
+          otool -L inject_jni.dylib
+          echo ""
+          echo "=== File ==="
+          file inject_jni.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: inject_jni.dylib
+          path: inject_jni.dylib
+          retention-days: 30
