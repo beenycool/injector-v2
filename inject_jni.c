@@ -10,8 +10,7 @@
  *   clang -dynamiclib \
  *     -I/opt/homebrew/opt/openjdk@17/include \
  *     -I/opt/homebrew/opt/openjdk@17/include/darwin \
- *     -o inject_jni.dylib inject_jni.c \
- *     -framework JavaVM
+ *     -o inject_jni.dylib inject_jni.c
  *
  *   codesign --force --sign - inject_jni.dylib
  *

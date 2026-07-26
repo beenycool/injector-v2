@@ -22,11 +22,17 @@ JNI_INCLUDE  = -I$(JAVA_HOME)/include -I$(JAVA_HOME)/include/darwin
 # ── Compiler flags ──────────────────────────────────────────────────────────
 CC           = clang
 CFLAGS       = -dynamiclib -Wall -Wextra -O2 $(JNI_INCLUDE)
-LDFLAGS      = -framework JavaVM
+# LDFLAGS: intentionally empty — JNI symbols resolved at runtime via dlopen()+dlsym()
+LDFLAGS      =
 
 # Default target
 .PHONY: all
 all: $(DYLIBS) sign
+
+# Just check syntax without linking (useful for CI on non-macOS)
+.PHONY: test-syntax
+test-syntax: $(SRC)
+	$(CC) -c -Wall -Wextra $(JNI_INCLUDE) -o /dev/null $(SRC)
 
 # Build the dylib
 $(DYLIBS): $(SRC)
