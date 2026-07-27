@@ -1289,11 +1289,17 @@ static void *phase2_worker(void *arg) {
 
     STEP("Waiting for JVM...");
     milestone("STEP: Waiting for JVM...");
+    step_log("  entering dlsym poll loop...");
     while (!JVM_Finder && attempts < 120) {
         #pragma GCC diagnostic push
         #pragma GCC diagnostic ignored "-Wpedantic"
         JVM_Finder = (JVM_Finder_t)dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
         #pragma GCC diagnostic pop
+        {
+            char lbuf[192];
+            snprintf(lbuf, sizeof(lbuf), "  dlsym returned %p (attempt %d/120)", (void *)JVM_Finder, attempts);
+            step_log(lbuf);
+        }
         if (!JVM_Finder) {
             attempts++;
             if (attempts == 1 || attempts % 20 == 0) {
@@ -1304,6 +1310,7 @@ static void *phase2_worker(void *arg) {
             usleep(500000);
         }
     }
+    step_log("  exited dlsym poll loop");
     if (!JVM_Finder) { milestone("FAIL: dlsym JNI_GetCreatedJavaVMs"); step_log("ERROR: JVM symbol not found"); return NULL; }
     milestone("JVM dlsym OK");
     step_log("dlsym found JNI_GetCreatedJavaVMs, now polling for VMs...");
