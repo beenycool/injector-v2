@@ -28,6 +28,7 @@
  */
 
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
@@ -85,6 +86,18 @@ static void step_clear(void) {
         fprintf(stderr, "[*] Log cleared: %s\n", LOG_PATH);
         fflush(stderr);
     }
+}
+
+/* Write a milestone marker using write(2) for crash-proof durability.
+ * Even if the process dies immediately after, this is on disk. */
+static void milestone(const char *tag) {
+    int fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "%s\n", tag);
+    (void)!write(fd, buf, (size_t)n);
+    fsync(fd);
+    close(fd);
 }
 
 #define STEP(msg) do { step_log("STEP: " msg); } while(0)
@@ -1185,6 +1198,7 @@ static void update_frame_data(JNIEnv *env) {
 
 static void *phase2_worker(void *arg) {
     (void)arg;
+    milestone("=== Phase 2 worker started ===");
     step_clear();
     step_log("=== Phase 2 worker started ===");
 
@@ -1196,14 +1210,24 @@ static void *phase2_worker(void *arg) {
     jsize n_vms = 0;
 
     STEP("Waiting for JVM...");
+    milestone("STEP: Waiting for JVM...");
     while (!JVM_Finder && attempts < 120) {
         #pragma GCC diagnostic push
         #pragma GCC diagnostic ignored "-Wpedantic"
         JVM_Finder = (JVM_Finder_t)dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
         #pragma GCC diagnostic pop
-        if (!JVM_Finder) { attempts++; usleep(500000); }
+        if (!JVM_Finder) {
+            attempts++;
+            if (attempts == 1 || attempts % 20 == 0) {
+                char lbuf[128];
+                snprintf(lbuf, sizeof(lbuf), "  dlsym poll attempt %d/120...", attempts);
+                step_log(lbuf);
+            }
+            usleep(500000);
+        }
     }
-    if (!JVM_Finder) { step_log("ERROR: JVM symbol not found"); return NULL; }
+    if (!JVM_Finder) { milestone("FAIL: dlsym JNI_GetCreatedJavaVMs"); step_log("ERROR: JVM symbol not found"); return NULL; }
+    milestone("JVM dlsym OK");
     step_log("dlsym found JNI_GetCreatedJavaVMs, now polling for VMs...");
 
     attempts = 0;
@@ -1216,7 +1240,8 @@ static void *phase2_worker(void *arg) {
             usleep(500000);
         }
     }
-    if (n_vms == 0) { step_log("ERROR: no JVM created after 60s polling"); return NULL; }
+    if (n_vms == 0) { milestone("FAIL: no JVM created"); step_log("ERROR: no JVM created after 60s polling"); return NULL; }
+    milestone("JVM ready");
     step_log("JVM ready — attaching thread...");
 
     /* --- Attach and run discovery --- */
