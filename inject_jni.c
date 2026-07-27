@@ -71,6 +71,135 @@ static int check_and_clear_exception(JNIEnv *env) {
 }
 
 /*
+ * Log the details of a pending Java exception (message + stack trace)
+ * by calling Exception.toString() via JNI. Returns 1 if exception was
+ * pending and logged, 0 otherwise. Clears the exception.
+ */
+static int log_exception_details(JNIEnv *env, const char *prefix) {
+    if (!(*env)->ExceptionCheck(env)) return 0;
+
+    // Get the exception object
+    jthrowable exc = (*env)->ExceptionOccurred(env);
+    if (exc == NULL) {
+        (*env)->ExceptionClear(env);
+        return 1;
+    }
+
+    // Get exc.getClass().getName()
+    jclass exc_cls = (*env)->GetObjectClass(env, exc);
+    if (exc_cls) {
+        jmethodID get_name_mid = (*env)->GetMethodID(
+            env, exc_cls, "getName", "()Ljava/lang/String;");
+        if (get_name_mid) {
+            jstring name_str = (jstring)(*env)->CallObjectMethod(
+                env, exc_cls, get_name_mid);
+            if (name_str) {
+                const char *name_utf = (*env)->GetStringUTFChars(env, name_str, NULL);
+                if (name_utf) {
+                    char buf[512];
+                    snprintf(buf, sizeof(buf), "%s exception type: %s", prefix, name_utf);
+                    // fprintf to the JVM stderr is already used by ExceptionDescribe,
+                    // use our own log
+                    FILE *tmp = fopen(LOG_PATH, "a");
+                    if (tmp) {
+                        time_t now = time(NULL);
+                        struct tm *t = localtime(&now);
+                        fprintf(tmp, "[%02d:%02d:%02d] %s\n",
+                                t->tm_hour, t->tm_min, t->tm_sec, buf);
+                        fclose(tmp);
+                    }
+                    (*env)->ReleaseStringUTFChars(env, name_str, name_utf);
+                }
+            }
+        }
+    }
+
+    // Get exc.getMessage()
+    jmethodID get_msg_mid = (*env)->GetMethodID(
+        env, exc_cls, "getMessage", "()Ljava/lang/String;");
+    if (get_msg_mid) {
+        jstring msg_str = (jstring)(*env)->CallObjectMethod(
+            env, exc, get_msg_mid);
+        if (msg_str) {
+            const char *msg_utf = (*env)->GetStringUTFChars(env, msg_str, NULL);
+            if (msg_utf) {
+                char buf[512];
+                snprintf(buf, sizeof(buf), "%s exception message: %s", prefix, msg_utf);
+                FILE *tmp = fopen(LOG_PATH, "a");
+                if (tmp) {
+                    time_t now = time(NULL);
+                    struct tm *t = localtime(&now);
+                    fprintf(tmp, "[%02d:%02d:%02d] %s\n",
+                            t->tm_hour, t->tm_min, t->tm_sec, buf);
+                    fclose(tmp);
+                }
+                (*env)->ReleaseStringUTFChars(env, msg_str, msg_utf);
+            }
+        }
+    }
+
+    // Get the stack trace as a string
+    jmethodID to_string_mid = (*env)->GetMethodID(
+        env, exc_cls, "toString", "()Ljava/lang/String;");
+    if (to_string_mid) {
+        jstring trace_str = (jstring)(*env)->CallObjectMethod(
+            env, exc, to_string_mid);
+        if (trace_str) {
+            const char *trace_utf = (*env)->GetStringUTFChars(env, trace_str, NULL);
+            if (trace_utf) {
+                FILE *tmp = fopen(LOG_PATH, "a");
+                if (tmp) {
+                    time_t now = time(NULL);
+                    struct tm *t = localtime(&now);
+                    fprintf(tmp, "[%02d:%02d:%02d] %s exception: %s\n",
+                            t->tm_hour, t->tm_min, t->tm_sec, prefix, trace_utf);
+                    fclose(tmp);
+                }
+                (*env)->ReleaseStringUTFChars(env, trace_str, trace_utf);
+            }
+        }
+    }
+
+    (*env)->ExceptionClear(env);
+
+    // Cleanup refs
+    if (exc_cls) (*env)->DeleteLocalRef(env, exc_cls);
+    (*env)->DeleteLocalRef(env, exc);
+
+    return 1;
+}
+
+/*
+ * Log the result of calling toString() on a Java object.
+ */
+static void log_obj_to_string(JNIEnv *env, jobject obj, const char *label) {
+    if (!obj || !env) return;
+
+    jclass obj_cls = (*env)->GetObjectClass(env, obj);
+    if (!obj_cls) return;
+
+    jmethodID to_string_mid = (*env)->GetMethodID(
+        env, obj_cls, "toString", "()Ljava/lang/String;");
+    if (!to_string_mid) {
+        (*env)->DeleteLocalRef(env, obj_cls);
+        return;
+    }
+
+    jstring str = (jstring)(*env)->CallObjectMethod(env, obj, to_string_mid);
+    if (str) {
+        const char *utf = (*env)->GetStringUTFChars(env, str, NULL);
+        if (utf) {
+            char buf[1024];
+            snprintf(buf, sizeof(buf), "%s = %s", label, utf);
+            log_write(buf);
+            (*env)->ReleaseStringUTFChars(env, str, utf);
+        }
+        (*env)->DeleteLocalRef(env, str);
+    }
+    (*env)->DeleteLocalRef(env, obj_cls);
+}
+
+/*
  * Attach the current thread to the JVM and return a JNIEnv*.
  * Returns NULL on failure.
  */
@@ -111,10 +240,97 @@ static JNIEnv* attach_to_jvm(JavaVM *jvm) {
  * find application classes.  By obtaining the current thread's context
  * classloader and calling Class.forName(name, true, loader), we delegate to
  * the classloader that actually loaded the game.
+ *
+ * Returns: a local-ref jclass, or NULL on failure.
  */
-static jclass find_class_with_thread_loader(JNIEnv *env, const char *name) {
+static jclass find_class_with_loader(JNIEnv *env, const char *name,
+                                      jobject class_loader) {
     char buf[512];
 
+    // Log which classloader we're using
+    log_obj_to_string(env, class_loader, "ClassLoader");
+
+    // java.lang.Class.forName(String, boolean, ClassLoader)
+    jclass class_cls = (*env)->FindClass(env, "java/lang/Class");
+    if (!class_cls || check_and_clear_exception(env)) {
+        log_write("ERROR: FindClass(java/lang/Class) failed");
+        return NULL;
+    }
+
+    jmethodID for_name_mid = (*env)->GetStaticMethodID(
+        env, class_cls,
+        "forName",
+        "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
+    if (!for_name_mid || check_and_clear_exception(env)) {
+        log_write("ERROR: GetStaticMethodID(forName) failed");
+        (*env)->DeleteLocalRef(env, class_cls);
+        return NULL;
+    }
+
+    jstring class_name_str = (*env)->NewStringUTF(env, name);
+    if (!class_name_str || check_and_clear_exception(env)) {
+        log_write("ERROR: NewStringUTF failed");
+        (*env)->DeleteLocalRef(env, class_cls);
+        return NULL;
+    }
+
+    jclass result = (jclass)(*env)->CallStaticObjectMethod(
+        env, class_cls, for_name_mid,
+        class_name_str,
+        JNI_TRUE,        // initialize
+        class_loader);
+
+    if (log_exception_details(env, "Class.forName")) {
+        snprintf(buf, sizeof(buf),
+                 "  -> Class.forName(\"%s\", true, classLoader) FAILED", name);
+        log_write(buf);
+        result = NULL;
+    } else if (result != NULL) {
+        snprintf(buf, sizeof(buf),
+                 "SUCCESS: Found %s", name);
+        log_write(buf);
+    } else {
+        snprintf(buf, sizeof(buf),
+                 "ERROR: Class.forName(\"%s\", ...) returned NULL (no exception)", name);
+        log_write(buf);
+    }
+
+    // Also try FindClass directly as a secondary strategy
+    if (result == NULL) {
+        snprintf(buf, sizeof(buf), "Trying FindClass(\"%s\") as fallback...", name);
+        log_write(buf);
+
+        jclass fc_result = (*env)->FindClass(env, name);
+        if (fc_result && !(*env)->ExceptionCheck(env)) {
+            snprintf(buf, sizeof(buf), "SUCCESS: FindClass(\"%s\") found the class!", name);
+            log_write(buf);
+            (*env)->DeleteLocalRef(env, class_name_str);
+            (*env)->DeleteLocalRef(env, class_cls);
+            return fc_result;
+        }
+        // Clear any exception from FindClass
+        check_and_clear_exception(env);
+        log_write("FindClass fallback also failed");
+    }
+
+    (*env)->DeleteLocalRef(env, class_name_str);
+    (*env)->DeleteLocalRef(env, class_cls);
+
+    return result;
+}
+
+/*
+ * Obtain the appropriate classloader for class lookup.
+ *
+ * Tries in order:
+ *   1. Thread.currentThread().getContextClassLoader()
+ *   2. ClassLoader.getSystemClassLoader()
+ *   3. JNI FindClass (bootstrap classloader) — indicated by returning NULL
+ *
+ * Returns: a local-ref jobject (classloader), or NULL meaning "use bootstrap".
+ * The caller must delete the local ref when done.
+ */
+static jobject get_class_loader(JNIEnv *env) {
     // 1. java.lang.Thread class
     jclass thread_cls = (*env)->FindClass(env, "java/lang/Thread");
     if (!thread_cls || check_and_clear_exception(env)) {
@@ -122,7 +338,7 @@ static jclass find_class_with_thread_loader(JNIEnv *env, const char *name) {
         return NULL;
     }
 
-    // 2. Thread.currentThread()
+    // 1a. Thread.currentThread()
     jmethodID current_thread_mid = (*env)->GetStaticMethodID(
         env, thread_cls, "currentThread", "()Ljava/lang/Thread;");
     if (!current_thread_mid || check_and_clear_exception(env)) {
@@ -139,7 +355,10 @@ static jclass find_class_with_thread_loader(JNIEnv *env, const char *name) {
         return NULL;
     }
 
-    // 3. Thread.getContextClassLoader()
+    // Log current thread name
+    log_obj_to_string(env, current_thread, "Current thread");
+
+    // 1b. Thread.getContextClassLoader()
     jmethodID get_ccl_mid = (*env)->GetMethodID(
         env, thread_cls, "getContextClassLoader", "()Ljava/lang/ClassLoader;");
     if (!get_ccl_mid || check_and_clear_exception(env)) {
@@ -151,111 +370,82 @@ static jclass find_class_with_thread_loader(JNIEnv *env, const char *name) {
 
     jobject class_loader = (*env)->CallObjectMethod(
         env, current_thread, get_ccl_mid);
-    if (check_and_clear_exception(env)) {
-        log_write("ERROR: CallObjectMethod(getContextClassLoader) threw exception");
-        // Still possible — context classloader might be null even without exception
+    if (log_exception_details(env, "getContextClassLoader")) {
+        log_write("WARNING: getContextClassLoader() threw exception");
+        // Fall through — class_loader may still be non-null
     }
-    // getContextClassLoader() may return NULL for native-attached threads.
-    // This is expected JVM behavior. Fall back to system classloader.
-    if (class_loader == NULL) {
-        log_write("WARNING: Thread context classloader is NULL for native-attached thread");
-        log_write("  -> Falling back to ClassLoader.getSystemClassLoader()");
 
-        jclass system_cls = (*env)->FindClass(env, "java/lang/ClassLoader");
-        if (!system_cls || check_and_clear_exception(env)) {
-            log_write("ERROR: FindClass(java/lang/ClassLoader) failed");
-            (*env)->DeleteLocalRef(env, current_thread);
-            (*env)->DeleteLocalRef(env, thread_cls);
-            return NULL;
-        }
-
-        jmethodID get_sys_mid = (*env)->GetStaticMethodID(
-            env, system_cls, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
-        if (!get_sys_mid || check_and_clear_exception(env)) {
-            log_write("ERROR: GetStaticMethodID(getSystemClassLoader) failed");
-            (*env)->DeleteLocalRef(env, system_cls);
-            (*env)->DeleteLocalRef(env, current_thread);
-            (*env)->DeleteLocalRef(env, thread_cls);
-            return NULL;
-        }
-
-        class_loader = (*env)->CallStaticObjectMethod(
-            env, system_cls, get_sys_mid);
-        if (!class_loader || check_and_clear_exception(env)) {
-            log_write("ERROR: CallStaticObjectMethod(getSystemClassLoader) failed");
-            (*env)->DeleteLocalRef(env, system_cls);
-            (*env)->DeleteLocalRef(env, current_thread);
-            (*env)->DeleteLocalRef(env, thread_cls);
-            return NULL;
-        }
-        (*env)->DeleteLocalRef(env, system_cls);
-        log_write("Got system ClassLoader");
-    } else {
+    // Check if context classloader is non-null
+    if (class_loader != NULL) {
         log_write("Got thread context ClassLoader");
+        log_obj_to_string(env, class_loader, "  -> context ClassLoader");
+        (*env)->DeleteLocalRef(env, current_thread);
+        (*env)->DeleteLocalRef(env, thread_cls);
+        return class_loader;
     }
 
-    // 4. java.lang.Class.forName(String, boolean, ClassLoader)
-    jclass class_cls = (*env)->FindClass(env, "java/lang/Class");
-    if (!class_cls || check_and_clear_exception(env)) {
-        log_write("ERROR: FindClass(java/lang/Class) failed");
-        (*env)->DeleteLocalRef(env, class_loader);
+    // 2. getContextClassLoader() returned NULL.
+    // This is normal for native threads attached via JNI.
+    log_write("WARNING: Thread context classloader is NULL (native thread)");
+    log_write("  -> Falling back to ClassLoader.getSystemClassLoader()");
+
+    jclass system_cls = (*env)->FindClass(env, "java/lang/ClassLoader");
+    if (!system_cls || check_and_clear_exception(env)) {
+        log_write("ERROR: FindClass(java/lang/ClassLoader) failed");
         (*env)->DeleteLocalRef(env, current_thread);
         (*env)->DeleteLocalRef(env, thread_cls);
         return NULL;
     }
 
-    jmethodID for_name_mid = (*env)->GetStaticMethodID(
-        env, class_cls,
-        "forName",
-        "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
-    if (!for_name_mid || check_and_clear_exception(env)) {
-        log_write("ERROR: GetStaticMethodID(forName) failed");
-        (*env)->DeleteLocalRef(env, class_cls);
-        (*env)->DeleteLocalRef(env, class_loader);
+    jmethodID get_sys_mid = (*env)->GetStaticMethodID(
+        env, system_cls, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
+    if (!get_sys_mid || check_and_clear_exception(env)) {
+        log_write("ERROR: GetStaticMethodID(getSystemClassLoader) failed");
+        (*env)->DeleteLocalRef(env, system_cls);
         (*env)->DeleteLocalRef(env, current_thread);
         (*env)->DeleteLocalRef(env, thread_cls);
         return NULL;
     }
 
-    jstring class_name_str = (*env)->NewStringUTF(env, name);
-    if (!class_name_str || check_and_clear_exception(env)) {
-        log_write("ERROR: NewStringUTF failed");
-        (*env)->DeleteLocalRef(env, class_cls);
-        (*env)->DeleteLocalRef(env, class_loader);
+    class_loader = (*env)->CallStaticObjectMethod(
+        env, system_cls, get_sys_mid);
+    if (log_exception_details(env, "getSystemClassLoader")) {
+        log_write("ERROR: getSystemClassLoader() threw exception");
+        (*env)->DeleteLocalRef(env, system_cls);
         (*env)->DeleteLocalRef(env, current_thread);
         (*env)->DeleteLocalRef(env, thread_cls);
         return NULL;
     }
 
-    jclass result = (jclass)(*env)->CallStaticObjectMethod(
-        env, class_cls, for_name_mid,
-        class_name_str,
-        JNI_TRUE,        // initialize
-        class_loader);
-
-    if (check_and_clear_exception(env)) {
-        snprintf(buf, sizeof(buf),
-                 "ERROR: Class.forName(\"%s\", true, classLoader) threw exception", name);
-        log_write(buf);
-        result = NULL;
-    } else if (result != NULL) {
-        snprintf(buf, sizeof(buf),
-                 "SUCCESS: Found class %s via thread context classloader", name);
-        log_write(buf);
-    } else {
-        snprintf(buf, sizeof(buf),
-                 "ERROR: Class.forName(\"%s\", ...) returned NULL (no exception)", name);
-        log_write(buf);
+    if (!class_loader) {
+        log_write("ERROR: getSystemClassLoader() returned NULL");
+        (*env)->DeleteLocalRef(env, system_cls);
+        (*env)->DeleteLocalRef(env, current_thread);
+        (*env)->DeleteLocalRef(env, thread_cls);
+        return NULL;
     }
 
-    // Cleanup local refs (keep result)
-    (*env)->DeleteLocalRef(env, class_name_str);
-    (*env)->DeleteLocalRef(env, class_cls);
-    (*env)->DeleteLocalRef(env, class_loader);
+    log_write("Got system ClassLoader");
+    log_obj_to_string(env, class_loader, "  -> system ClassLoader");
+
+    // Log parent chain
+    jmethodID get_parent_mid = (*env)->GetMethodID(
+        env, system_cls, "getParent", "()Ljava/lang/ClassLoader;");
+    if (get_parent_mid) {
+        jobject parent = (*env)->CallObjectMethod(env, class_loader, get_parent_mid);
+        if (parent) {
+            log_obj_to_string(env, parent, "  -> system ClassLoader.parent");
+            (*env)->DeleteLocalRef(env, parent);
+        } else {
+            log_write("  -> system ClassLoader.parent = NULL (bootstrap)");
+        }
+    }
+
+    (*env)->DeleteLocalRef(env, system_cls);
     (*env)->DeleteLocalRef(env, current_thread);
     (*env)->DeleteLocalRef(env, thread_cls);
 
-    return result;
+    return class_loader;
 }
 
 /* ── main injection logic ────────────────────────────────────────────────── */
@@ -269,6 +459,10 @@ static void *injection_worker(void *arg) {
     (void)arg;
 
     log_write("=== inject_jni worker thread started ===");
+
+    struct timespec t_start, t_phase;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+    t_phase = t_start;
 
     // ── Phase 1: locate JNI_GetCreatedJavaVMs symbol ────────────────────
     //
@@ -288,7 +482,7 @@ static void *injection_worker(void *arg) {
     int attempts = 0;
     const int max_attempts = 120;  // ~60 seconds with 500ms sleep
 
-    log_write("Waiting for JNI_GetCreatedJavaVMs (JVM startup)...");
+    log_write("Phase 1: Waiting for JNI_GetCreatedJavaVMs (JVM startup)...");
 
     while (attempts < max_attempts) {
         JNI_GetCreatedJavaVMs_ptr =
@@ -310,7 +504,18 @@ static void *injection_worker(void *arg) {
         return NULL;
     }
 
-    log_write("Found JNI_GetCreatedJavaVMs symbol via RTLD_DEFAULT");
+    {
+        struct timespec t_now;
+        clock_gettime(CLOCK_MONOTONIC, &t_now);
+        double elapsed = (t_now.tv_sec - t_phase.tv_sec)
+            + (t_now.tv_nsec - t_phase.tv_nsec) / 1e9;
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "Found JNI_GetCreatedJavaVMs (attempt %d, %.1fs since start)",
+                 attempts, elapsed);
+        log_write(buf);
+        t_phase = t_now;
+    }
 
     // ── Phase 2: wait for JVM to be created ──────────────────────────────
 
@@ -318,7 +523,7 @@ static void *injection_worker(void *arg) {
     jsize n_vms = 0;
     attempts = 0;
 
-    log_write("Waiting for JVM to be created...");
+    log_write("Phase 2: Waiting for JVM to be created...");
 
     while (attempts < max_attempts) {
         jint rs = JNI_GetCreatedJavaVMs_ptr(&jvm, 1, &n_vms);
@@ -339,13 +544,21 @@ static void *injection_worker(void *arg) {
     }
 
     {
+        struct timespec t_now;
+        clock_gettime(CLOCK_MONOTONIC, &t_now);
+        double elapsed = (t_now.tv_sec - t_phase.tv_sec)
+            + (t_now.tv_nsec - t_phase.tv_nsec) / 1e9;
         char buf[128];
-        snprintf(buf, sizeof(buf), "JVM found (n_vms=%d)", (int)n_vms);
+        snprintf(buf, sizeof(buf),
+                 "JVM found (n_vms=%d, attempt %d, %.1fs for JVM startup)",
+                 (int)n_vms, attempts, elapsed);
         log_write(buf);
+        t_phase = t_now;
     }
 
     // ── Phase 3: attach current thread to JVM ────────────────────────────
 
+    log_write("Phase 3: Attaching to JVM...");
     JNIEnv *env = attach_to_jvm(jvm);
     if (!env) {
         FILE *f = fopen(RESULT_PATH, "w");
@@ -357,49 +570,133 @@ static void *injection_worker(void *arg) {
         return NULL;
     }
 
-    // ── Phase 4: find Minecraft class via thread context classloader ─────
+    {
+        struct timespec t_now;
+        clock_gettime(CLOCK_MONOTONIC, &t_now);
+        double elapsed = (t_now.tv_sec - t_phase.tv_sec)
+            + (t_now.tv_nsec - t_phase.tv_nsec) / 1e9;
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Attached to JVM (%.3fs)", elapsed);
+        log_write(buf);
+        t_phase = t_now;
+    }
+
+    // ── Phase 4: find Minecraft class ────────────────────────────────────
     //
     // The JVM starts before Minecraft's classes are loaded.  Poll until the
     // class appears (or timeout).  Each attempt gets a fresh JNIEnv* since
     // the classloader may not be fully initialized yet.
 
-    log_write("Looking up net.minecraft.client.Minecraft via context classloader...");
-    jclass mc_class = NULL;
+    // Class names to try, in order of preference
+    const char *class_names[] = {
+        "net.minecraft.client.Minecraft",
+        "net.minecraft.client.main.Main",
+        "net.minecraft.launchwrapper.Launch",
+        "net.minecraft.launchwrapper.LaunchClassLoader",
+        "com.moonsworth.lunar.genesis.Genesis",
+        "com.moonsworth.lunar.LunarClient",
+        NULL
+    };
+
+    jclass found_class = NULL;
+    const char *found_name = NULL;
     attempts = 0;
 
-    while (attempts < max_attempts) {
+    log_write("Phase 4: Looking up Minecraft class via thread context classloader...");
+
+    while (attempts < max_attempts && found_class == NULL) {
         // Need a fresh env each attempt because JNI local refs accumulate
         JNIEnv *env = attach_to_jvm(jvm);
-        if (env) {
-            mc_class = find_class_with_thread_loader(
-                env, "net.minecraft.client.Minecraft");
-            if (mc_class != NULL) {
-                // Promote to global ref so it survives env cleanup
-                mc_class = (jclass)(*env)->NewGlobalRef(env, mc_class);
-                break;
+        if (!env) {
+            attempts++;
+            usleep(500000);
+            continue;
+        }
+
+        // Try each class name with current env
+        for (int c = 0; class_names[c] != NULL && found_class == NULL; c++) {
+            // Get classloader (fresh each attempt)
+            jobject loader = get_class_loader(env);
+            if (loader) {
+                found_class = find_class_with_loader(env, class_names[c], loader);
+                if (found_class) {
+                    // Promote to global ref so it survives env cleanup
+                    found_class = (jclass)(*env)->NewGlobalRef(env, found_class);
+                    found_name = class_names[c];
+                }
+                (*env)->DeleteLocalRef(env, loader);
+            } else {
+                // get_class_loader returned NULL — try FindClass directly
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                         "No classloader available, trying FindClass(\"%s\")...",
+                         class_names[c]);
+                log_write(buf);
+                jclass fc = (*env)->FindClass(env, class_names[c]);
+                if (fc && !(*env)->ExceptionCheck(env)) {
+                    // Check for null (class not found)
+                    snprintf(buf, sizeof(buf),
+                             "SUCCESS: FindClass(\"%s\") found the class!", class_names[c]);
+                    log_write(buf);
+                    found_class = (jclass)(*env)->NewGlobalRef(env, fc);
+                    found_name = class_names[c];
+                    (*env)->DeleteLocalRef(env, fc);
+                } else {
+                    check_and_clear_exception(env);
+                    snprintf(buf, sizeof(buf),
+                             "FindClass(\"%s\") failed", class_names[c]);
+                    log_write(buf);
+                }
             }
         }
+
+        // Log progress every 10 attempts
+        if (attempts % 10 == 0 && attempts > 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "  ... still looking (attempt %d/%d)", attempts, max_attempts);
+            log_write(buf);
+        }
+
         attempts++;
-        usleep(500000);
+        if (found_class == NULL) {
+            usleep(500000);
+        }
+    }
+
+    {
+        struct timespec t_now;
+        clock_gettime(CLOCK_MONOTONIC, &t_now);
+        double elapsed_total = (t_now.tv_sec - t_start.tv_sec)
+            + (t_now.tv_nsec - t_start.tv_nsec) / 1e9;
+        double elapsed_phase = (t_now.tv_sec - t_phase.tv_sec)
+            + (t_now.tv_nsec - t_phase.tv_nsec) / 1e9;
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "Lookup finished: attempt=%d lookup=%.1fs total=%.1fs",
+                 attempts, elapsed_phase, elapsed_total);
+        log_write(buf);
+        t_phase = t_now;
     }
 
     // ── Phase 5: write result ────────────────────────────────────────────
 
+    log_write("Phase 5: Writing result...");
     FILE *f = fopen(RESULT_PATH, "w");
     if (f) {
-        if (mc_class != NULL) {
-            fprintf(f, "SUCCESS: Found net.minecraft.client.Minecraft\n");
-            fprintf(f, "  Class pointer: %p\n", (void *)mc_class);
-            fprintf(f, "  Classloader:   thread context classloader\n");
-            fprintf(f, "  Method:        Class.forName(name, true, classLoader)\n");
+        if (found_class != NULL && found_name != NULL) {
+            fprintf(f, "SUCCESS: Found class\n");
+            fprintf(f, "  Class:         %s\n", found_name);
+            fprintf(f, "  Class pointer: %p\n", (void *)found_class);
+            fprintf(f, "  Method:        Class.forName via thread/system classloader\n");
             log_write("Result written: SUCCESS");
         } else {
-            fprintf(f, "FAILURE: Could not find net.minecraft.client.Minecraft\n");
-            fprintf(f, "  The class was not found via the thread context classloader.\n");
-            fprintf(f, "  Possible causes:\n");
-            fprintf(f, "    - Minecraft hasn't loaded yet (check timing)\n");
-            fprintf(f, "    - The class name has changed (try other obfuscated names)\n");
-            fprintf(f, "    - The context classloader is null or different\n");
+            fprintf(f, "FAILURE: Could not find any target class\n");
+            fprintf(f, "  Tried classes:\n");
+            for (int c = 0; class_names[c] != NULL; c++) {
+                fprintf(f, "    - %s\n", class_names[c]);
+            }
+            fprintf(f, "  \n");
+            fprintf(f, "  Check /tmp/inject_log.txt for detailed debug info.\n");
             log_write("Result written: FAILURE");
         }
         fclose(f);
@@ -407,7 +704,17 @@ static void *injection_worker(void *arg) {
         log_write("ERROR: Could not write result file");
     }
 
-    log_write("=== inject_jni worker thread finished ===");
+    // ── Done ──
+    {
+        struct timespec t_now;
+        clock_gettime(CLOCK_MONOTONIC, &t_now);
+        double elapsed = (t_now.tv_sec - t_start.tv_sec)
+            + (t_now.tv_nsec - t_start.tv_nsec) / 1e9;
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "=== inject_jni worker thread finished (total %.1fs) ===", elapsed);
+        log_write(buf);
+    }
     log_close();
     return NULL;
 }
