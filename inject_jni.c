@@ -451,10 +451,161 @@ static jobject get_class_loader(JNIEnv *env) {
 /* ── main injection logic ────────────────────────────────────────────────── */
 
 /*
- * This function runs in a worker thread spawned by the constructor.
- * It polls until libjvm.dylib becomes available, then finds the JVM,
- * attaches, and looks up the Minecraft class.
+ * Try to get the LaunchClassLoader from net.minecraft.launchwrapper.Launch.
+ *
+ * The Launch class has a static field:
+ *   public static LaunchClassLoader classLoader;
+ *
+ * This is the classloader that actually loads Minecraft game classes.
+ * Returns a local-ref jobject (the LaunchClassLoader), or NULL if not
+ * yet available.
  */
+static jobject get_launch_classloader(JNIEnv *env) {
+    // Use system classloader to find the Launch class
+    jobject sys_loader = NULL;
+    jclass launch_cls = NULL;
+
+    // First try FindClass — works if the class is on the system classpath
+    launch_cls = (*env)->FindClass(env, "net/minecraft/launchwrapper/Launch");
+    if (!launch_cls) {
+        check_and_clear_exception(env);
+
+        // Fallback: use Class.forName with system classloader
+        sys_loader = get_class_loader(env);
+        if (!sys_loader) return NULL;
+
+        jclass class_cls = (*env)->FindClass(env, "java/lang/Class");
+        if (!class_cls || check_and_clear_exception(env)) {
+            (*env)->DeleteLocalRef(env, sys_loader);
+            return NULL;
+        }
+        jmethodID for_name_mid = (*env)->GetStaticMethodID(
+            env, class_cls, "forName",
+            "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
+        if (!for_name_mid || check_and_clear_exception(env)) {
+            (*env)->DeleteLocalRef(env, class_cls);
+            (*env)->DeleteLocalRef(env, sys_loader);
+            return NULL;
+        }
+        jstring name_str = (*env)->NewStringUTF(env, "net.minecraft.launchwrapper.Launch");
+        if (!name_str || check_and_clear_exception(env)) {
+            (*env)->DeleteLocalRef(env, class_cls);
+            (*env)->DeleteLocalRef(env, sys_loader);
+            return NULL;
+        }
+        launch_cls = (jclass)(*env)->CallStaticObjectMethod(
+            env, class_cls, for_name_mid, name_str, JNI_TRUE, sys_loader);
+        if (log_exception_details(env, "getLaunchClassLoader") || !launch_cls) {
+            (*env)->DeleteLocalRef(env, name_str);
+            (*env)->DeleteLocalRef(env, class_cls);
+            (*env)->DeleteLocalRef(env, sys_loader);
+            return NULL;
+        }
+        (*env)->DeleteLocalRef(env, name_str);
+        (*env)->DeleteLocalRef(env, class_cls);
+        (*env)->DeleteLocalRef(env, sys_loader);
+    }
+
+    log_write("Found net.minecraft.launchwrapper.Launch class, reading classLoader field...");
+
+    // Get the static field "classLoader"
+    jfieldID classloader_fid = (*env)->GetStaticFieldID(
+        env, launch_cls, "classLoader",
+        "Lnet/minecraft/launchwrapper/LaunchClassLoader;");
+    if (!classloader_fid || check_and_clear_exception(env)) {
+        log_write("get_launch_classloader: field 'classLoader' not found");
+        (*env)->DeleteLocalRef(env, launch_cls);
+        return NULL;
+    }
+
+    jobject launch_cl = (*env)->GetStaticObjectField(
+        env, launch_cls, classloader_fid);
+    if (!launch_cl || check_and_clear_exception(env)) {
+        log_write("get_launch_classloader: classLoader field is NULL (not initialized yet)");
+        (*env)->DeleteLocalRef(env, launch_cls);
+        return NULL;
+    }
+
+    log_write("Got LaunchClassLoader instance!");
+    log_obj_to_string(env, launch_cl, "  -> LaunchClassLoader");
+
+    // Log its parent chain
+    jclass loader_cls = (*env)->GetObjectClass(env, launch_cl);
+    if (loader_cls) {
+        jmethodID get_parent_mid = (*env)->GetMethodID(
+            env, loader_cls, "getParent", "()Ljava/lang/ClassLoader;");
+        if (get_parent_mid) {
+            jobject parent = (*env)->CallObjectMethod(env, launch_cl, get_parent_mid);
+            if (parent) {
+                log_obj_to_string(env, parent, "  -> LaunchClassLoader.parent");
+                (*env)->DeleteLocalRef(env, parent);
+            }
+        }
+        (*env)->DeleteLocalRef(env, loader_cls);
+    }
+
+    (*env)->DeleteLocalRef(env, launch_cls);
+    return launch_cl;
+}
+
+/*
+ * Try to find a Minecraft class by chaining through known classloaders.
+ *
+ * Strategy:
+ *   1. Get the system classloader
+ *   2. Try to find class directly
+ *   3. If that fails and Launch class is available, get LaunchClassLoader
+ *      and try with that
+ *
+ * Returns a global-ref jclass, or NULL.
+ */
+static jclass find_minecraft_class(JNIEnv *env) {
+    const char *target = "net.minecraft.client.Minecraft";
+    const char *fallback_names[] = {
+        "net.minecraft.client.main.Main",
+        NULL
+    };
+
+    // ── Strategy 1: system classloader ──
+    log_write("find_minecraft_class: trying system classloader...");
+    jobject sys_loader = get_class_loader(env);
+    if (sys_loader) {
+        jclass result = find_class_with_loader(env, target, sys_loader);
+        if (result) return result;
+        (*env)->DeleteLocalRef(env, sys_loader);
+    }
+
+    // ── Strategy 2: LaunchClassLoader ──
+    log_write("find_minecraft_class: trying LaunchClassLoader...");
+    jobject launch_loader = get_launch_classloader(env);
+    if (launch_loader) {
+        jclass result = find_class_with_loader(env, target, launch_loader);
+        if (result) {
+            (*env)->DeleteLocalRef(env, launch_loader);
+            return result;
+        }
+        // Also try fallback class names with LaunchClassLoader
+        for (int c = 0; fallback_names[c] != NULL; c++) {
+            result = find_class_with_loader(env, fallback_names[c], launch_loader);
+            if (result) {
+                (*env)->DeleteLocalRef(env, launch_loader);
+                return result;
+            }
+        }
+        (*env)->DeleteLocalRef(env, launch_loader);
+    }
+
+    // ── Strategy 3: FindClass direct ──
+    log_write("find_minecraft_class: trying FindClass direct...");
+    jclass fc = (*env)->FindClass(env, target);
+    if (fc && !(*env)->ExceptionCheck(env)) {
+        log_write("SUCCESS: FindClass(Minecraft) found the class!");
+        return (jclass)(*env)->NewGlobalRef(env, fc);
+    }
+    check_and_clear_exception(env);
+
+    return NULL;
+}
 static void *injection_worker(void *arg) {
     (void)arg;
 
@@ -584,25 +735,13 @@ static void *injection_worker(void *arg) {
     // ── Phase 4: find Minecraft class ────────────────────────────────────
     //
     // The JVM starts before Minecraft's classes are loaded.  Poll until the
-    // class appears (or timeout).  Each attempt gets a fresh JNIEnv* since
-    // the classloader may not be fully initialized yet.
-
-    // Class names to try, in order of preference
-    const char *class_names[] = {
-        "net.minecraft.client.Minecraft",
-        "net.minecraft.client.main.Main",
-        "net.minecraft.launchwrapper.Launch",
-        "net.minecraft.launchwrapper.LaunchClassLoader",
-        "com.moonsworth.lunar.genesis.Genesis",
-        "com.moonsworth.lunar.LunarClient",
-        NULL
-    };
+    // class appears (or timeout).
 
     jclass found_class = NULL;
-    const char *found_name = NULL;
+    const char *found_name = "net.minecraft.client.Minecraft";
     attempts = 0;
 
-    log_write("Phase 4: Looking up Minecraft class via thread context classloader...");
+    log_write("Phase 4: Looking up Minecraft class (chained classloader strategy)...");
 
     while (attempts < max_attempts && found_class == NULL) {
         // Need a fresh env each attempt because JNI local refs accumulate
@@ -613,41 +752,74 @@ static void *injection_worker(void *arg) {
             continue;
         }
 
-        // Try each class name with current env
-        for (int c = 0; class_names[c] != NULL && found_class == NULL; c++) {
-            // Get classloader (fresh each attempt)
+        // Try the chained approach: system classloader → LaunchClassLoader
+        found_class = find_minecraft_class(env);
+
+        if (found_class == NULL) {
+            // Also try to find any known class as a bridge
+            const char *fallback_classes[] = {
+                "net.minecraft.launchwrapper.LaunchClassLoader",
+                "net.minecraft.launchwrapper.Launch",
+                "com.moonsworth.lunar.genesis.Genesis",
+                "com.moonsworth.lunar.LunarClient",
+                NULL
+            };
+
             jobject loader = get_class_loader(env);
             if (loader) {
-                found_class = find_class_with_loader(env, class_names[c], loader);
-                if (found_class) {
-                    // Promote to global ref so it survives env cleanup
-                    found_class = (jclass)(*env)->NewGlobalRef(env, found_class);
-                    found_name = class_names[c];
+                for (int c = 0; fallback_classes[c] != NULL && found_class == NULL; c++) {
+                    jclass bridge = find_class_with_loader(env, fallback_classes[c], loader);
+                    if (bridge) {
+                        char buf[256];
+                        snprintf(buf, sizeof(buf), "Found bridge class: %s", fallback_classes[c]);
+                        log_write(buf);
+
+                        // If this is Launch, try its classLoader field
+                        if (strcmp(fallback_classes[c], "net.minecraft.launchwrapper.Launch") == 0 ||
+                            strcmp(fallback_classes[c], "net.minecraft.launchwrapper.LaunchClassLoader") == 0) {
+                            jobject lcl = get_launch_classloader(env);
+                            if (lcl) {
+                                found_class = find_class_with_loader(env, "net.minecraft.client.Minecraft", lcl);
+                                if (found_class) {
+                                    found_class = (jclass)(*env)->NewGlobalRef(env, found_class);
+                                }
+                                (*env)->DeleteLocalRef(env, lcl);
+                            }
+                        }
+
+                        // If we still haven't found Minecraft, try finding it via
+                        // the bridge class's own classloader
+                        if (found_class == NULL) {
+                            jclass bridge_cls = (*env)->GetObjectClass(env, bridge);
+                            if (bridge_cls) {
+                                jmethodID get_loader_mid = (*env)->GetMethodID(
+                                    env, bridge_cls, "getClassLoader", "()Ljava/lang/ClassLoader;");
+                                if (get_loader_mid) {
+                                    jobject bridge_loader = (*env)->CallObjectMethod(
+                                        env, bridge, get_loader_mid);
+                                    if (bridge_loader && !check_and_clear_exception(env)) {
+                                        log_obj_to_string(env, bridge_loader, "  -> bridge class's own classloader");
+                                        found_class = find_class_with_loader(
+                                            env, "net.minecraft.client.Minecraft", bridge_loader);
+                                        if (found_class) {
+                                            found_class = (jclass)(*env)->NewGlobalRef(env, found_class);
+                                        }
+                                        (*env)->DeleteLocalRef(env, bridge_loader);
+                                    } else {
+                                        check_and_clear_exception(env);
+                                    }
+                                }
+                                (*env)->DeleteLocalRef(env, bridge_cls);
+                            }
+                        }
+
+                        (*env)->DeleteLocalRef(env, bridge);
+                    }
                 }
                 (*env)->DeleteLocalRef(env, loader);
-            } else {
-                // get_class_loader returned NULL — try FindClass directly
-                char buf[256];
-                snprintf(buf, sizeof(buf),
-                         "No classloader available, trying FindClass(\"%s\")...",
-                         class_names[c]);
-                log_write(buf);
-                jclass fc = (*env)->FindClass(env, class_names[c]);
-                if (fc && !(*env)->ExceptionCheck(env)) {
-                    // Check for null (class not found)
-                    snprintf(buf, sizeof(buf),
-                             "SUCCESS: FindClass(\"%s\") found the class!", class_names[c]);
-                    log_write(buf);
-                    found_class = (jclass)(*env)->NewGlobalRef(env, fc);
-                    found_name = class_names[c];
-                    (*env)->DeleteLocalRef(env, fc);
-                } else {
-                    check_and_clear_exception(env);
-                    snprintf(buf, sizeof(buf),
-                             "FindClass(\"%s\") failed", class_names[c]);
-                    log_write(buf);
-                }
             }
+        } else {
+            found_class = (jclass)(*env)->NewGlobalRef(env, found_class);
         }
 
         // Log progress every 10 attempts
@@ -683,19 +855,18 @@ static void *injection_worker(void *arg) {
     log_write("Phase 5: Writing result...");
     FILE *f = fopen(RESULT_PATH, "w");
     if (f) {
-        if (found_class != NULL && found_name != NULL) {
+        if (found_class != NULL) {
             fprintf(f, "SUCCESS: Found class\n");
             fprintf(f, "  Class:         %s\n", found_name);
             fprintf(f, "  Class pointer: %p\n", (void *)found_class);
-            fprintf(f, "  Method:        Class.forName via thread/system classloader\n");
+            fprintf(f, "  Method:        Chained classloader (system → LaunchClassLoader)\n");
             log_write("Result written: SUCCESS");
         } else {
-            fprintf(f, "FAILURE: Could not find any target class\n");
-            fprintf(f, "  Tried classes:\n");
-            for (int c = 0; class_names[c] != NULL; c++) {
-                fprintf(f, "    - %s\n", class_names[c]);
-            }
-            fprintf(f, "  \n");
+            fprintf(f, "FAILURE: Could not find net.minecraft.client.Minecraft\n");
+            fprintf(f, "  Chained strategies exhausted:\n");
+            fprintf(f, "    - System classloader\n");
+            fprintf(f, "    - LaunchClassLoader\n");
+            fprintf(f, "    - Bridge class's own classloader\n");
             fprintf(f, "  Check /tmp/inject_log.txt for detailed debug info.\n");
             log_write("Result written: FAILURE");
         }
