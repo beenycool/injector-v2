@@ -16,5 +16,9 @@
 # ReasonIX
 reasonix.toml
 
+# Test logs (user may copy here)
+inject_log.txt
+jni_class_found.txt
+
 # Logs
 /tmp/*

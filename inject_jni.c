@@ -606,6 +606,186 @@ static jclass find_minecraft_class(JNIEnv *env) {
 
     return NULL;
 }
+
+/*
+ * Enumerate all active Java threads and collect unique context classloaders.
+ * Then try to find the Minecraft class with each one.
+ *
+ * This is the most reliable strategy: the Minecraft Client thread has
+ * the correct context classloader that can see game classes, even though
+ * our native-attached thread doesn't.  By calling Thread.getAllStackTraces(),
+ * iterating all threads, and testing each thread's context classloader
+ * via Class.forName(target, true, cl), we find the classloader that
+ * actually loaded the game.
+ *
+ * Returns a global-ref jclass, or NULL.
+ */
+static jclass find_class_via_threads(JNIEnv *env, const char *target) {
+    char buf[512];
+    int thread_count = 0;
+
+    // ── 1. Get Thread.getAllStackTraces() → Map<Thread, StackTraceElement[]> ──
+    jclass thread_cls = (*env)->FindClass(env, "java/lang/Thread");
+    if (!thread_cls || check_and_clear_exception(env)) {
+        log_write("find_class_via_threads: FindClass(Thread) failed");
+        return NULL;
+    }
+
+    jmethodID get_all_mid = (*env)->GetStaticMethodID(
+        env, thread_cls, "getAllStackTraces", "()Ljava/util/Map;");
+    if (!get_all_mid || check_and_clear_exception(env)) {
+        log_write("find_class_via_threads: getMethod(getAllStackTraces) failed");
+        (*env)->DeleteLocalRef(env, thread_cls);
+        return NULL;
+    }
+
+    jobject traces_map = (*env)->CallStaticObjectMethod(env, thread_cls, get_all_mid);
+    if (!traces_map || check_and_clear_exception(env)) {
+        log_write("find_class_via_threads: getAllStackTraces() returned NULL");
+        (*env)->DeleteLocalRef(env, thread_cls);
+        return NULL;
+    }
+
+    // ── 2. Map.keySet() → Set<Thread> ──
+    jclass map_cls = (*env)->GetObjectClass(env, traces_map);
+    jmethodID key_set_mid = (*env)->GetMethodID(env, map_cls, "keySet", "()Ljava/util/Set;");
+    if (!key_set_mid || check_and_clear_exception(env)) {
+        (*env)->DeleteLocalRef(env, map_cls);
+        (*env)->DeleteLocalRef(env, thread_cls);
+        (*env)->DeleteLocalRef(env, traces_map);
+        return NULL;
+    }
+
+    jobject key_set = (*env)->CallObjectMethod(env, traces_map, key_set_mid);
+    if (!key_set || check_and_clear_exception(env)) {
+        (*env)->DeleteLocalRef(env, map_cls);
+        (*env)->DeleteLocalRef(env, thread_cls);
+        (*env)->DeleteLocalRef(env, traces_map);
+        return NULL;
+    }
+
+    // ── 3. Set.iterator() → Iterator<Thread> ──
+    jclass set_cls = (*env)->GetObjectClass(env, key_set);
+    jmethodID iterator_mid = (*env)->GetMethodID(env, set_cls, "iterator", "()Ljava/util/Iterator;");
+    if (!iterator_mid || check_and_clear_exception(env)) {
+        (*env)->DeleteLocalRef(env, set_cls);
+        (*env)->DeleteLocalRef(env, key_set);
+        (*env)->DeleteLocalRef(env, map_cls);
+        (*env)->DeleteLocalRef(env, thread_cls);
+        (*env)->DeleteLocalRef(env, traces_map);
+        return NULL;
+    }
+
+    jobject iterator = (*env)->CallObjectMethod(env, key_set, iterator_mid);
+    if (!iterator || check_and_clear_exception(env)) {
+        (*env)->DeleteLocalRef(env, set_cls);
+        (*env)->DeleteLocalRef(env, key_set);
+        (*env)->DeleteLocalRef(env, map_cls);
+        (*env)->DeleteLocalRef(env, thread_cls);
+        (*env)->DeleteLocalRef(env, traces_map);
+        return NULL;
+    }
+
+    jclass iter_cls = (*env)->GetObjectClass(env, iterator);
+    jmethodID has_next_mid = (*env)->GetMethodID(env, iter_cls, "hasNext", "()Z");
+    jmethodID next_mid = (*env)->GetMethodID(env, iter_cls, "next", "()Ljava/lang/Object;");
+
+    // Thread.getContextClassLoader() + getName()
+    jmethodID get_ccl_mid = (*env)->GetMethodID(
+        env, thread_cls, "getContextClassLoader", "()Ljava/lang/ClassLoader;");
+    jmethodID get_name_mid = (*env)->GetMethodID(
+        env, thread_cls, "getName", "()Ljava/lang/String;");
+
+    // Class.forName(String, boolean, ClassLoader)
+    jclass class_cls_pre = (*env)->FindClass(env, "java/lang/Class");
+    jmethodID for_name_mid_pre = NULL;
+    if (class_cls_pre) {
+        for_name_mid_pre = (*env)->GetStaticMethodID(
+            env, class_cls_pre, "forName",
+            "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
+    }
+
+    // ── 4. Iterate threads, test each context classloader ──
+    jclass result = NULL;
+    int found_count = 0;
+
+    while ((*env)->CallBooleanMethod(env, iterator, has_next_mid) && result == NULL) {
+        jobject thread = (*env)->CallObjectMethod(env, iterator, next_mid);
+        if (!thread) continue;
+        thread_count++;
+
+        if (get_ccl_mid && get_name_mid && for_name_mid_pre) {
+            // Get thread name for logging
+            jstring tname = (jstring)(*env)->CallObjectMethod(env, thread, get_name_mid);
+            const char *name_utf = NULL;
+            if (tname) {
+                name_utf = (*env)->GetStringUTFChars(env, tname, NULL);
+            }
+
+            // Get context classloader
+            jobject cl = (*env)->CallObjectMethod(env, thread, get_ccl_mid);
+
+            // Only log classloaders every 20 threads (reduce noise)
+            if (thread_count % 20 == 0 && name_utf) {
+                snprintf(buf, sizeof(buf),
+                         "  ... scanned %d threads (current: %s)", thread_count, name_utf);
+                log_write(buf);
+            }
+
+            if (cl && !(*env)->ExceptionCheck(env)) {
+                // Try Class.forName(target) with this classloader
+                jstring target_str = (*env)->NewStringUTF(env, target);
+                if (target_str) {
+                    jclass candidate = (jclass)(*env)->CallStaticObjectMethod(
+                        env, class_cls_pre, for_name_mid_pre,
+                        target_str, JNI_TRUE, cl);
+
+                    if (candidate && !(*env)->ExceptionCheck(env)) {
+                        snprintf(buf, sizeof(buf),
+                                 "SUCCESS: Thread '%s' classloader can find %s!",
+                                 name_utf ? name_utf : "?", target);
+                        log_write(buf);
+                        log_obj_to_string(env, cl, "  -> Minecraft classloader");
+
+                        found_count++;
+                        result = (jclass)(*env)->NewGlobalRef(env, candidate);
+                        (*env)->DeleteLocalRef(env, candidate);
+                    } else {
+                        check_and_clear_exception(env);
+                    }
+                    (*env)->DeleteLocalRef(env, target_str);
+                }
+            } else {
+                check_and_clear_exception(env);
+            }
+
+            if (tname) {
+                (*env)->ReleaseStringUTFChars(env, tname, name_utf);
+                (*env)->DeleteLocalRef(env, tname);
+            }
+            if (cl) (*env)->DeleteLocalRef(env, cl);
+        }
+        (*env)->DeleteLocalRef(env, thread);
+    }
+
+    snprintf(buf, sizeof(buf),
+             "find_class_via_threads: scanned %d threads, found %d with class %s",
+             thread_count, found_count, target);
+    log_write(buf);
+
+    // Cleanup
+    if (class_cls_pre) (*env)->DeleteLocalRef(env, class_cls_pre);
+    (*env)->DeleteLocalRef(env, iter_cls);
+    (*env)->DeleteLocalRef(env, set_cls);
+    (*env)->DeleteLocalRef(env, iterator);
+    (*env)->DeleteLocalRef(env, key_set);
+    (*env)->DeleteLocalRef(env, map_cls);
+    (*env)->DeleteLocalRef(env, thread_cls);
+    (*env)->DeleteLocalRef(env, traces_map);
+
+    return result;
+}
+
 static void *injection_worker(void *arg) {
     (void)arg;
 
@@ -738,13 +918,11 @@ static void *injection_worker(void *arg) {
     // class appears (or timeout).
 
     jclass found_class = NULL;
-    const char *found_name = "net.minecraft.client.Minecraft";
     attempts = 0;
 
-    log_write("Phase 4: Looking up Minecraft class (chained classloader strategy)...");
+    log_write("Phase 4: Looking up Minecraft class (thread-enumeration strategy)...");
 
     while (attempts < max_attempts && found_class == NULL) {
-        // Need a fresh env each attempt because JNI local refs accumulate
         JNIEnv *env = attach_to_jvm(jvm);
         if (!env) {
             attempts++;
@@ -752,65 +930,54 @@ static void *injection_worker(void *arg) {
             continue;
         }
 
-        // Try the chained approach: system classloader → LaunchClassLoader
-        found_class = find_minecraft_class(env);
+        // Strategy: enumerate ALL Java threads, test each context classloader
+        // This catches the "Client thread" which has the correct classloader
+        found_class = find_class_via_threads(env, "net.minecraft.client.Minecraft");
 
         if (found_class == NULL) {
-            // Also try to find any known class as a bridge
-            const char *fallback_classes[] = {
+            // Also try: find any known bridge class + its classloader
+            const char *fallbacks[] = {
                 "net.minecraft.launchwrapper.LaunchClassLoader",
                 "net.minecraft.launchwrapper.Launch",
                 "com.moonsworth.lunar.genesis.Genesis",
                 "com.moonsworth.lunar.LunarClient",
+                "com.moonsworth.lunar.legacy.IIOOIIHRIOCCIHHCIRICHIIHIHOHII",
                 NULL
             };
 
             jobject loader = get_class_loader(env);
             if (loader) {
-                for (int c = 0; fallback_classes[c] != NULL && found_class == NULL; c++) {
-                    jclass bridge = find_class_with_loader(env, fallback_classes[c], loader);
+                for (int c = 0; fallbacks[c] != NULL && found_class == NULL; c++) {
+                    jclass bridge = find_class_with_loader(env, fallbacks[c], loader);
                     if (bridge) {
                         char buf[256];
-                        snprintf(buf, sizeof(buf), "Found bridge class: %s", fallback_classes[c]);
+                        snprintf(buf, sizeof(buf), "Found bridge class: %s", fallbacks[c]);
                         log_write(buf);
 
-                        // If this is Launch, try its classLoader field
-                        if (strcmp(fallback_classes[c], "net.minecraft.launchwrapper.Launch") == 0 ||
-                            strcmp(fallback_classes[c], "net.minecraft.launchwrapper.LaunchClassLoader") == 0) {
-                            jobject lcl = get_launch_classloader(env);
-                            if (lcl) {
-                                found_class = find_class_with_loader(env, "net.minecraft.client.Minecraft", lcl);
-                                if (found_class) {
-                                    found_class = (jclass)(*env)->NewGlobalRef(env, found_class);
-                                }
-                                (*env)->DeleteLocalRef(env, lcl);
-                            }
-                        }
-
-                        // If we still haven't found Minecraft, try finding it via
-                        // the bridge class's own classloader
-                        if (found_class == NULL) {
-                            jclass bridge_cls = (*env)->GetObjectClass(env, bridge);
-                            if (bridge_cls) {
-                                jmethodID get_loader_mid = (*env)->GetMethodID(
-                                    env, bridge_cls, "getClassLoader", "()Ljava/lang/ClassLoader;");
-                                if (get_loader_mid) {
-                                    jobject bridge_loader = (*env)->CallObjectMethod(
-                                        env, bridge, get_loader_mid);
-                                    if (bridge_loader && !check_and_clear_exception(env)) {
-                                        log_obj_to_string(env, bridge_loader, "  -> bridge class's own classloader");
-                                        found_class = find_class_with_loader(
-                                            env, "net.minecraft.client.Minecraft", bridge_loader);
-                                        if (found_class) {
-                                            found_class = (jclass)(*env)->NewGlobalRef(env, found_class);
-                                        }
-                                        (*env)->DeleteLocalRef(env, bridge_loader);
-                                    } else {
-                                        check_and_clear_exception(env);
+                        // Try bridge.getDeclaredMethods() → toString() for debugging
+                        // Also try the bridge's own getClassLoader()
+                        jclass bridge_meta = (*env)->GetObjectClass(env, bridge);
+                        if (bridge_meta) {
+                            jmethodID get_cl_mid = (*env)->GetMethodID(
+                                env, bridge_meta, "getClassLoader",
+                                "()Ljava/lang/ClassLoader;");
+                            if (get_cl_mid) {
+                                jobject bridge_load = (*env)->CallObjectMethod(
+                                    env, bridge, get_cl_mid);
+                                if (bridge_load && !check_and_clear_exception(env)) {
+                                    log_obj_to_string(env, bridge_load,
+                                                     "  -> bridge getClassLoader()");
+                                    found_class = find_class_with_loader(
+                                        env, "net.minecraft.client.Minecraft", bridge_load);
+                                    if (found_class) {
+                                        found_class = (jclass)(*env)->NewGlobalRef(env, found_class);
                                     }
+                                    (*env)->DeleteLocalRef(env, bridge_load);
+                                } else {
+                                    check_and_clear_exception(env);
                                 }
-                                (*env)->DeleteLocalRef(env, bridge_cls);
                             }
+                            (*env)->DeleteLocalRef(env, bridge_meta);
                         }
 
                         (*env)->DeleteLocalRef(env, bridge);
@@ -822,10 +989,10 @@ static void *injection_worker(void *arg) {
             found_class = (jclass)(*env)->NewGlobalRef(env, found_class);
         }
 
-        // Log progress every 10 attempts
         if (attempts % 10 == 0 && attempts > 0) {
             char buf[128];
-            snprintf(buf, sizeof(buf), "  ... still looking (attempt %d/%d)", attempts, max_attempts);
+            snprintf(buf, sizeof(buf),
+                     "  ... still looking (attempt %d/%d)", attempts, max_attempts);
             log_write(buf);
         }
 
@@ -856,17 +1023,17 @@ static void *injection_worker(void *arg) {
     FILE *f = fopen(RESULT_PATH, "w");
     if (f) {
         if (found_class != NULL) {
-            fprintf(f, "SUCCESS: Found class\n");
-            fprintf(f, "  Class:         %s\n", found_name);
+            fprintf(f, "SUCCESS: Found Minecraft class\n");
+            fprintf(f, "  Class:         net.minecraft.client.Minecraft\n");
             fprintf(f, "  Class pointer: %p\n", (void *)found_class);
-            fprintf(f, "  Method:        Chained classloader (system → LaunchClassLoader)\n");
+            fprintf(f, "  Method:        Thread enumeration → context classloader\n");
             log_write("Result written: SUCCESS");
         } else {
             fprintf(f, "FAILURE: Could not find net.minecraft.client.Minecraft\n");
-            fprintf(f, "  Chained strategies exhausted:\n");
-            fprintf(f, "    - System classloader\n");
-            fprintf(f, "    - LaunchClassLoader\n");
-            fprintf(f, "    - Bridge class's own classloader\n");
+            fprintf(f, "  Strategies attempted:\n");
+            fprintf(f, "    1. Enumerate ALL Java threads' context classloaders\n");
+            fprintf(f, "    2. System classloader → Launch/Genesis bridge classes\n");
+            fprintf(f, "    3. FindClass direct (bootstrap classloader)\n");
             fprintf(f, "  Check /tmp/inject_log.txt for detailed debug info.\n");
             log_write("Result written: FAILURE");
         }
