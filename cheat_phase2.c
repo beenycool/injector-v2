@@ -499,7 +499,7 @@ static jobject discover_field_by_type(JNIEnv *env, jclass cls,
             (*env)->DeleteLocalRef(env, field);
             continue;
         }
-        int match = (*env)->IsSameObject(env, ft, target_type_cls);
+        int match = (*env)->IsAssignableFrom(env, ft, target_type_cls);
         (*env)->DeleteLocalRef(env, ft);
         if (!match) {
             (*env)->DeleteLocalRef(env, field);
