@@ -648,7 +648,6 @@ static int run_discovery(JNIEnv *env) {
         (*env)->DeleteLocalRef(env, mc_instance);
         free(getmc_name);
     }
-    (*env)->DeleteLocalRef(env, getmc_method);
 
     /* --- 3. Find World class --- */
     STEP("Finding net.minecraft.world.World...");
@@ -665,7 +664,7 @@ static int run_discovery(JNIEnv *env) {
         return -1;
     }
     set_accessible(env, world_field);
-    jobject theWorld = field_get(env, world_field, mc_instance);
+    jobject theWorld = field_get(env, world_field, g_disc.mc_instance);
     if (!theWorld) {
         step_log("ERROR: theWorld field is null");
         (*env)->DeleteLocalRef(env, world_field);
