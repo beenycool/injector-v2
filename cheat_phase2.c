@@ -47,24 +47,44 @@
 #include <jni.h>
 
 /* ───────────────────────────────────────────────────────────────────────────
- * Logging — opens/closes every write (no stale handles across threads)
+ * Logging — writes to file AND stderr so we always see output.
+ * Uses fopen+fclose each call (no stale handles).
  * ─────────────────────────────────────────────────────────────────────────── */
 #define LOG_PATH    "/tmp/phase2_step.txt"
 #define RESULT_PATH "/tmp/phase2_result.txt"
 
+static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static void step_log(const char *msg) {
-    FILE *f = fopen(LOG_PATH, "a");
-    if (!f) return;
+    pthread_mutex_lock(&g_log_mutex);
+
+    /* stderr — always works, visible in terminal */
     time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    fprintf(f, "[%02d:%02d:%02d] %s\n",
-            t->tm_hour, t->tm_min, t->tm_sec, msg);
-    fclose(f);
+    struct tm tm_buf;
+    localtime_r(&now, &tm_buf);
+    fprintf(stderr, "[%02d:%02d:%02d] %s\n",
+            tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, msg);
+    fflush(stderr);
+
+    /* file */
+    FILE *f = fopen(LOG_PATH, "a");
+    if (f) {
+        fprintf(f, "[%02d:%02d:%02d] %s\n",
+                tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, msg);
+        fflush(f);
+        fclose(f);
+    }
+
+    pthread_mutex_unlock(&g_log_mutex);
 }
 
 static void step_clear(void) {
     FILE *f = fopen(LOG_PATH, "w");
-    if (f) fclose(f);
+    if (f) {
+        fclose(f);
+        fprintf(stderr, "[*] Log cleared: %s\n", LOG_PATH);
+        fflush(stderr);
+    }
 }
 
 #define STEP(msg) do { step_log("STEP: " msg); } while(0)
@@ -234,17 +254,40 @@ static JNIEnv *attach_to_jvm(JavaVM *jvm) {
    not in the system classloader) */
 static jobject get_context_classloader(JNIEnv *env) {
     jclass thread_cls = (*env)->FindClass(env, "java/lang/Thread");
-    if (!thread_cls) { check_exc(env); return NULL; }
+    if (!thread_cls) {
+        step_log("FindClass(java/lang/Thread) FAILED");
+        check_exc(env);
+        return NULL;
+    }
     jmethodID current_mid = (*env)->GetStaticMethodID(env, thread_cls,
         "currentThread", "()Ljava/lang/Thread;");
-    if (!current_mid) { check_exc(env); (*env)->DeleteLocalRef(env, thread_cls); return NULL; }
+    if (!current_mid) {
+        step_log("GetStaticMethodID(currentThread) FAILED");
+        check_exc(env);
+        (*env)->DeleteLocalRef(env, thread_cls);
+        return NULL;
+    }
     jobject thread = (*env)->CallStaticObjectMethod(env, thread_cls, current_mid);
-    if (!thread) { check_exc(env); (*env)->DeleteLocalRef(env, thread_cls); return NULL; }
+    if (!thread || check_exc(env)) {
+        step_log("currentThread() returned null or threw exception");
+        (*env)->DeleteLocalRef(env, thread_cls);
+        return NULL;
+    }
     jmethodID getloader_mid = (*env)->GetMethodID(env, thread_cls,
         "getContextClassLoader", "()Ljava/lang/ClassLoader;");
-    if (!getloader_mid) { check_exc(env); (*env)->DeleteLocalRef(env, thread_cls); return NULL; }
+    if (!getloader_mid) {
+        step_log("GetMethodID(getContextClassLoader) FAILED");
+        check_exc(env);
+        (*env)->DeleteLocalRef(env, thread_cls);
+        return NULL;
+    }
     jobject loader = (*env)->CallObjectMethod(env, thread, getloader_mid);
-    check_exc(env);
+    if (check_exc(env) || !loader) {
+        step_log("getContextClassLoader() returned null or threw exception");
+        (*env)->DeleteLocalRef(env, thread);
+        (*env)->DeleteLocalRef(env, thread_cls);
+        return NULL;
+    }
     (*env)->DeleteLocalRef(env, thread);
     (*env)->DeleteLocalRef(env, thread_cls);
     return loader;
@@ -433,6 +476,7 @@ static jobject discover_list_field(JNIEnv *env, jclass cls,
 static int run_discovery(JNIEnv *env) {
     jobject sys_loader = get_context_classloader(env);
     if (!sys_loader) { step_log("ERROR: get_context_classloader failed"); return -1; }
+    step_log("Context classloader obtained successfully");
 
     /* --- 1. Find Minecraft class --- */
     STEP("Finding net.minecraft.client.Minecraft...");
@@ -1030,15 +1074,21 @@ static void *phase2_worker(void *arg) {
         #pragma GCC diagnostic pop
         if (!JVM_Finder) { attempts++; usleep(500000); }
     }
-    if (!JVM_Finder) { step_log("ERROR: JVM not found"); return NULL; }
+    if (!JVM_Finder) { step_log("ERROR: JVM symbol not found"); return NULL; }
+    step_log("dlsym found JNI_GetCreatedJavaVMs, now polling for VMs...");
 
     attempts = 0;
     while (n_vms == 0 && attempts < 120) {
         JVM_Finder(&jvm, 1, &n_vms);
-        if (n_vms == 0) { attempts++; usleep(500000); }
+        if (n_vms == 0) {
+            attempts++;
+            if (attempts == 1 || attempts % 20 == 0)
+                step_log("  still waiting for JVM creation...");
+            usleep(500000);
+        }
     }
-    if (n_vms == 0) { step_log("ERROR: JVM not created"); return NULL; }
-    step_log("JVM ready");
+    if (n_vms == 0) { step_log("ERROR: no JVM created after 60s polling"); return NULL; }
+    step_log("JVM ready — attaching thread...");
 
     /* --- Attach and run discovery --- */
     JNIEnv *env = attach_to_jvm(jvm);
