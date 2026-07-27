@@ -761,18 +761,30 @@ static int run_discovery(JNIEnv *env) {
     g_disc.theWorld_fid = (*env)->GetFieldID(env, mc_cls, world_fname, world_desc);
     free(world_desc);
     if (!g_disc.theWorld_fid) { step_log("ERROR: GetFieldID for theWorld failed"); free((void *)world_fname); free(world_type_name); (*env)->DeleteLocalRef(env, world_field); return -1; }
-    /* Verify: read the value via JNI (no setAccessible needed) */
-    jobject theWorld = (*env)->GetObjectField(env, g_disc.mc_instance, g_disc.theWorld_fid);
-    if (!theWorld) {
-        step_log("ERROR: theWorld field is null");
-        (*env)->DeleteLocalRef(env, world_field);
-        return -1;
+    /* Poll for theWorld to become non-null (Minecraft may still be initializing).
+     * Don't fail — rendering will handle null gracefully. */
+    int world_attempts = 0;
+    jobject theWorld = NULL;
+    while (world_attempts < 60) {
+        theWorld = (*env)->GetObjectField(env, g_disc.mc_instance, g_disc.theWorld_fid);
+        if (theWorld) break;
+        world_attempts++;
+        if (world_attempts == 1 || world_attempts % 10 == 0) {
+            char wbuf[128];
+            snprintf(wbuf, sizeof(wbuf), "  waiting for theWorld field to be populated (%d/60)...", world_attempts);
+            step_log(wbuf);
+        }
+        usleep(500000);
     }
-    (*env)->DeleteLocalRef(env, theWorld); /* will re-get each frame */
+    if (theWorld) {
+        (*env)->DeleteLocalRef(env, theWorld);
+        step_log("theWorld discovered successfully");
+    } else {
+        step_log("WARNING: theWorld is still null after 30s — ESP will activate when you enter a world");
+    }
     free((void *)world_fname);
     free(world_type_name);
     (*env)->DeleteLocalRef(env, world_field);
-    step_log("theWorld discovered successfully");
 
     /* --- 5. Discover thePlayer field --- */
     STEP("Discovering thePlayer field (type EntityPlayer)...");
