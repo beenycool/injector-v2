@@ -1,4 +1,4 @@
-name: Build inject_jni.dylib
+name: Build dylibs
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Linux — syntax check only (fast; can't produce a .dylib)
+  # Linux — syntax check only (fast; can't produce .dylib or link OpenGL)
   syntax-check:
     runs-on: ubuntu-latest
     steps:
@@ -25,7 +25,7 @@ jobs:
           JAVA_HOME="$JAVA_HOME" make test-syntax
           echo "Syntax check passed."
 
-  # macOS — full .dylib build + ad-hoc sign
+  # macOS — full .dylib build + ad-hoc sign for both phases
   macos-build:
     runs-on: macos-latest
     steps:
@@ -37,19 +37,32 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Build dylib
+      - name: Build dylibs
         run: |
-          JAVA_HOME="$JAVA_HOME" make
+          JAVA_HOME="$JAVA_HOME" make all
 
-      - name: Verify binary
+      - name: Verify binaries
         run: |
+          echo "=== inject_jni.dylib ==="
           file inject_jni.dylib
           ls -lh inject_jni.dylib
           lipo -info inject_jni.dylib
+          echo ""
+          echo "=== cheat_phase2.dylib ==="
+          file cheat_phase2.dylib
+          ls -lh cheat_phase2.dylib
+          lipo -info cheat_phase2.dylib
 
-      - name: Upload artifact
+      - name: Upload inject_jni.dylib
         uses: actions/upload-artifact@v4
         with:
           name: inject_jni.dylib
           path: inject_jni.dylib
+          retention-days: 30
+
+      - name: Upload cheat_phase2.dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: cheat_phase2.dylib
+          path: cheat_phase2.dylib
           retention-days: 30
