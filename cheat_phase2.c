@@ -47,30 +47,24 @@
 #include <jni.h>
 
 /* ───────────────────────────────────────────────────────────────────────────
- * Logging
+ * Logging — opens/closes every write (no stale handles across threads)
  * ─────────────────────────────────────────────────────────────────────────── */
-#define LOG_PATH  "/tmp/phase2_step.txt"
+#define LOG_PATH    "/tmp/phase2_step.txt"
 #define RESULT_PATH "/tmp/phase2_result.txt"
 
-static FILE *g_log = NULL;
-
 static void step_log(const char *msg) {
-    if (!g_log) {
-        g_log = fopen(LOG_PATH, "a");
-        if (!g_log) return;
-    }
+    FILE *f = fopen(LOG_PATH, "a");
+    if (!f) return;
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
-    fprintf(g_log, "[%02d:%02d:%02d] %s\n",
+    fprintf(f, "[%02d:%02d:%02d] %s\n",
             t->tm_hour, t->tm_min, t->tm_sec, msg);
-    fflush(g_log);
+    fclose(f);
 }
 
-/* Overwrite on each step for a quick glance; append for all logs */
 static void step_clear(void) {
-    g_log = fopen(LOG_PATH, "w");
-    if (g_log) fclose(g_log);
-    g_log = NULL;
+    FILE *f = fopen(LOG_PATH, "w");
+    if (f) fclose(f);
 }
 
 #define STEP(msg) do { step_log("STEP: " msg); } while(0)
@@ -236,16 +230,23 @@ static JNIEnv *attach_to_jvm(JavaVM *jvm) {
     return env;
 }
 
-/* Get the classloader (system classloader via ClassLoader.getSystemClassLoader) */
-static jobject get_system_classloader(JNIEnv *env) {
-    jclass cl_cls = (*env)->FindClass(env, "java/lang/ClassLoader");
-    if (!cl_cls) { check_exc(env); return NULL; }
-    jmethodID mid = (*env)->GetStaticMethodID(env, cl_cls, "getSystemClassLoader",
-                                               "()Ljava/lang/ClassLoader;");
-    if (!mid) { check_exc(env); (*env)->DeleteLocalRef(env, cl_cls); return NULL; }
-    jobject loader = (*env)->CallStaticObjectMethod(env, cl_cls, mid);
-    if (check_exc(env)) loader = NULL;
-    (*env)->DeleteLocalRef(env, cl_cls);
+/* Get the thread's context classloader (Lunar loads Minecraft classes here,
+   not in the system classloader) */
+static jobject get_context_classloader(JNIEnv *env) {
+    jclass thread_cls = (*env)->FindClass(env, "java/lang/Thread");
+    if (!thread_cls) { check_exc(env); return NULL; }
+    jmethodID current_mid = (*env)->GetStaticMethodID(env, thread_cls,
+        "currentThread", "()Ljava/lang/Thread;");
+    if (!current_mid) { check_exc(env); (*env)->DeleteLocalRef(env, thread_cls); return NULL; }
+    jobject thread = (*env)->CallStaticObjectMethod(env, thread_cls, current_mid);
+    if (!thread) { check_exc(env); (*env)->DeleteLocalRef(env, thread_cls); return NULL; }
+    jmethodID getloader_mid = (*env)->GetMethodID(env, thread_cls,
+        "getContextClassLoader", "()Ljava/lang/ClassLoader;");
+    if (!getloader_mid) { check_exc(env); (*env)->DeleteLocalRef(env, thread_cls); return NULL; }
+    jobject loader = (*env)->CallObjectMethod(env, thread, getloader_mid);
+    check_exc(env);
+    (*env)->DeleteLocalRef(env, thread);
+    (*env)->DeleteLocalRef(env, thread_cls);
     return loader;
 }
 
@@ -430,8 +431,8 @@ static jobject discover_list_field(JNIEnv *env, jclass cls,
  * Full runtime discovery pipeline
  * ─────────────────────────────────────────────────────────────────────────── */
 static int run_discovery(JNIEnv *env) {
-    jobject sys_loader = get_system_classloader(env);
-    if (!sys_loader) { step_log("ERROR: get_system_classloader failed"); return -1; }
+    jobject sys_loader = get_context_classloader(env);
+    if (!sys_loader) { step_log("ERROR: get_context_classloader failed"); return -1; }
 
     /* --- 1. Find Minecraft class --- */
     STEP("Finding net.minecraft.client.Minecraft...");
