@@ -1289,6 +1289,10 @@ static void *phase2_worker(void *arg) {
 
     STEP("Waiting for JVM...");
     milestone("STEP: Waiting for JVM...");
+    /* Sleep briefly to let dyld constructor finish and release its lock.
+     * Calling dlsym(RTLD_DEFAULT, ...) from a constructor-spawned thread
+     * can deadlock on macOS if dyld still holds its internal lock. */
+    usleep(200000);
     step_log("  entering dlsym poll loop...");
     while (!JVM_Finder && attempts < 120) {
         #pragma GCC diagnostic push
