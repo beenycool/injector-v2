@@ -1,106 +1,91 @@
-# injector-v2 — Lunar Client JNI Injection (macOS arm64)
+# Injector v2 — macOS Lunar Client cheat dylib
 
-Injects a custom `.dylib` into Lunar Client 1.8.9 on macOS to access the JVM via JNI, without reverse-engineering or modifying any Lunar/Java binaries.
+A native macOS ARM64 dylib injected into Lunar Client (1.8.9) via
+`DYLD_INSERT_LIBRARIES`. Uses the JNI Invocation API to attach to the hosting
+JVM, discover obfuscated game internals via Java reflection, and hook OpenGL
+for ESP overlay rendering.
 
 ## How it works
 
-Lunar Client's bundled Zulu JRE `java` binary has two key entitlements set to `true`:
+| File | Purpose |
+|---|---|
+| `cheat_phase2.c` | The dylib source — JNI injection, reflection discovery, fishhook OpenGL hook, ESP |
+| `launch_lunar.sh` | Shell script to launch Lunar Client with `DYLD_INSERT_LIBRARIES` |
+| `Makefile` | Build automation |
 
+**Injection flow:**
+
+1. `__attribute__((constructor))` runs at process start → spawns worker thread
+2. Worker polls `dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs")` until JVM is ready
+3. Attaches current thread to the JVM with `AttachCurrentThread`
+4. Uses **Java reflection** (`getDeclaredMethods`/`getDeclaredFields`) to discover
+   the actual names of `getMinecraft()`, `theWorld`, `thePlayer`,
+   `playerEntities`, and position fields — matched by **type**, not name.
+   This works regardless of Lunar's obfuscation / remapping (Ichor).
+5. Installs a **fishhook** interpose on `CGLFlushDrawable` (the macOS buffer swap)
+6. Every frame: save GL state → ortho projection → world-to-screen transform →
+   green ESP boxes around players → restore GL state → call original
+7. Worker thread updates player positions from JNI at ~60Hz
+
+**Logging:**
+
+| File | Contents |
+|---|---|
+| `/tmp/phase2_step.txt` | Timestamped step-by-step log (what was discovered, any errors) |
+| `/tmp/phase2_result.txt` | Quick summary: SUCCESS/FAILURE + what was found |
+
+## Prerequisites
+
+- macOS (Apple Silicon / ARM64)
+- Xcode Command Line Tools (`xcode-select --install`)
+- JDK 17 with JNI headers (e.g. `brew install openjdk@17`)
+- Lunar Client 1.8.9 installed (uses the Zulu 17 JRE bundled with Lunar)
+
+The `java` binary **must** have these Hardened Runtime entitlements set:
 - `com.apple.security.cs.allow-dyld-environment-variables`
 - `com.apple.security.cs.disable-library-validation`
 
-This means `DYLD_INSERT_LIBRARIES` works **without SIP modifications**. Our dylib loads early, spawns a worker thread, and waits for the JVM to start. Once the JVM is ready, it attaches and uses the **thread context classloader** to locate `net.minecraft.client.Minecraft` via `Class.forName(name, true, classLoader)`.
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `inject_jni.c` | The dylib source — JNI injection, class lookup |
-| `Makefile` | Build + sign for macOS arm64 |
-| `launch_lunar.sh` | Modified Lunar launch script with injection |
-| `.github/workflows/build.yml` | CI build on GitHub Actions (macOS runner) |
-
-## Build (on macOS arm64)
-
-### Prerequisites
-
-- macOS arm64 (Apple Silicon)
-- Xcode Command Line Tools (`clang`, `codesign`)
-- JDK 17 with JNI headers (e.g. `brew install openjdk@17`)
-
-### Commands
+If you haven't done this yet:
 
 ```bash
-# Build + sign (default JDK at /opt/homebrew/opt/openjdk@17)
-make all
-
-# Or specify a custom JDK path
-JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home make all
-
-# Verify the dylib
-make check
+codesign --force --options runtime \
+  --entitlements entitlements.plist \
+  --sign - \
+  "/Users/soodies/.lunarclient/jre/5f250fb4cc79aea565a238c6cc374182dbce30ba/zulu17.64.17-ca-jre17.0.18-macosx_aarch64/zulu-17.jre/Contents/Home/bin/java"
 ```
 
-### Manual compilation
+## Build & Run
 
 ```bash
-clang -dynamiclib \
-  -I/opt/homebrew/opt/openjdk@17/include \
-  -I/opt/homebrew/opt/openjdk@17/include/darwin \
-  -o inject_jni.dylib inject_jni.c
+# Build
+make
 
-codesign --force --sign - inject_jni.dylib
-```
-
-## Inject and run
-
-```bash
-# Default: injects ./inject_jni.dylib
+# Launch
 ./launch_lunar.sh
-
-# Specify a different dylib
-INJECT_DYLIB=/path/to/inject_jni.dylib ./launch_lunar.sh
-
-# Run without injection (vanilla Lunar)
-./launch_lunar.sh --no-inject
 ```
 
-## Verify injection
-
-After Lunar exits, check:
+### Options
 
 ```bash
-cat /tmp/jni_class_found.txt    # SUCCESS or FAILURE with debug info
-cat /tmp/inject_log.txt          # Step-by-step debug log
+./launch_lunar.sh --no-inject           # Launch without the cheat dylib
+CHEAT_DYLIB=/custom/path.dylib ./launch_lunar.sh  # Use a custom dylib path
 ```
 
-## Why the thread context classloader?
+## CI
 
-The default JNI `FindClass()` searches the **bootstrap classloader**, which only knows about JDK classes (java.lang.\*, java.util.\*, etc.). Minecraft's classes — including `net.minecraft.client.Minecraft` — are loaded by the application's custom classloader system (LaunchClassLoader / ModClassLoader).
+GitHub Actions builds `cheat_phase2.dylib` on macOS, ad-hoc signs it, and uploads
+the binary as an artifact. Note: the ad-hoc signature is machine-bound — you must
+re-sign the dylib on your machine before it can be injected.
 
-By obtaining the **current thread's context classloader** and calling `Class.forName(name, true, classLoader)`, we delegate to the same classloader that loaded the game, which **can** resolve Minecraft classes.
+## Debugging
 
-### JNI implementation
+If Lunar crashes on launch, check `/tmp/phase2_step.txt` for the last completed
+step. Common issues:
 
-```
-Thread.currentThread()           → get the calling thread
-  .getContextClassLoader()        → get its ClassLoader
-Class.forName(
-  "net.minecraft.client.Minecraft",
-  true,                           → initialize the class
-  classLoader                     → search via game's classloader
-)
-```
-
-## Next steps
-
-After the class is found:
-
-- Cache the `jclass` and get method/field IDs
-- Hook into the OpenGL rendering loop (`net.minecraft.client.renderer.EntityRenderer`, LWJGL)
-- Inject custom rendering, ESP, tracers, UI overlays, etc.
-- Add an ImGui overlay for a settings menu
-
-## License
-
-MIT
+| Symptom | Likely cause |
+|---|---|
+| dylib rejected | Missing entitlements on the `java` binary |
+| `/tmp/phase2_result.txt` not created | dylib failed to load (check console for dyld errors) |
+| `FAILURE: discovery failed` | Class/field names changed; check `phase2_step.txt` |
+| No ESP boxes showing | Hook installed but `CGLFlushDrawable` not called (LWJGL may use different path) |
+| Crash on game exit | Usually `libWebOSR-Binding.dylib` (unrelated to injector) |

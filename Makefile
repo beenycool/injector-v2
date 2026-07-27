@@ -1,4 +1,4 @@
-# Makefile — Build inject_jni.dylib and cheat_phase2.dylib (macOS arm64)
+# Makefile — Build cheat_phase2.dylib for Lunar Client injection (macOS arm64)
 #
 # Prerequisites:
 #   - macOS arm64 (Apple Silicon)
@@ -6,10 +6,8 @@
 #   - JDK 17 with JNI headers (e.g. /opt/homebrew/opt/openjdk@17)
 #
 # Usage:
-#   make            — build Phase 1 inject_jni.dylib
-#   make phase2     — build Phase 2 cheat_phase2.dylib (+ OpenGL hook & ESP)
-#   make all        — build both
-#   make sign       — ad-hoc sign all dylibs
+#   make            — build cheat_phase2.dylib and sign it
+#   make sign       — re-sign the dylib
 #   make clean      — remove build artifacts
 
 # ── JDK / JNI paths ─────────────────────────────────────────────────────────
@@ -36,44 +34,31 @@ ifeq ($(shell which $(CC) 2>/dev/null || echo nope),nope)
   endif
 endif
 
-# ── Phase 1: basic JNI injection dylib ─────────────────────────────────────
-.PHONY: phase1
-phase1: inject_jni.dylib sign-inject
+# ── Targets ──────────────────────────────────────────────────────────────────
+DYLIBS       = cheat_phase2.dylib
+SRC          = cheat_phase2.c
 
-inject_jni.dylib: inject_jni.c
-	@echo "==> Building Phase 1: $@ ..."
-	$(CC) -dynamiclib -Wall -Wextra -O2 $(JNI_INCLUDE) -o $@ inject_jni.c
+.PHONY: default
+default: $(DYLIBS) sign
+
+.PHONY: all
+all: $(DYLIBS) sign
+
+$(DYLIBS): $(SRC)
+	@echo "==> Building $@ ..."
+	$(CC) -dynamiclib -Wall -Wextra -O2 $(JNI_INCLUDE) $(OPENGL_FW) -o $@ $(SRC)
 	@echo "==> $@ built successfully"
 
-# ── Phase 2: JNI reflection + OpenGL hook + ESP ─────────────────────────────
-.PHONY: phase2
-phase2: cheat_phase2.dylib sign-phase2
-
-cheat_phase2.dylib: cheat_phase2.c
-	@echo "==> Building Phase 2: $@ ..."
-	$(CC) -dynamiclib -Wall -Wextra -O2 $(JNI_INCLUDE) $(OPENGL_FW) -o $@ cheat_phase2.c
-	@echo "==> $@ built successfully"
-
-# ── Ad-hoc code-sign (required for DYLD_INSERT_LIBRARIES) ───────────────────
-.PHONY: sign sign-inject sign-phase2
-sign: sign-inject sign-phase2
-
-sign-inject: inject_jni.dylib
-	@echo "==> Ad-hoc signing inject_jni.dylib ..."
-	codesign --force --sign - inject_jni.dylib
+# ── Ad-hoc code-sign ─────────────────────────────────────────────────────────
+.PHONY: sign
+sign: $(DYLIBS)
+	@echo "==> Ad-hoc signing $< ..."
+	codesign --force --sign - $<
 	@echo "==> Signed."
 
-sign-phase2: cheat_phase2.dylib
-	@echo "==> Ad-hoc signing cheat_phase2.dylib ..."
-	codesign --force --sign - cheat_phase2.dylib
-	@echo "==> Signed."
-
-# ── Syntax checks (CI) ──────────────────────────────────────────────────────
+# ── Syntax check (CI) ───────────────────────────────────────────────────────
 .PHONY: test-syntax
 test-syntax:
-	@echo "==> Syntax check: inject_jni.c ..."
-	$(CC) -c -Wall -Wextra $(JNI_INCLUDE) -o /dev/null inject_jni.c
-	@echo "    OK"
 	@echo "==> Syntax check: cheat_phase2.c ..."
 	$(CC) -c -Wall -Wextra $(JNI_INCLUDE) -iframework /System/Library/Frameworks -include OpenGL/gl.h -include OpenGL/OpenGL.h -o /dev/null cheat_phase2.c 2>/dev/null || \
 		(echo "    (skipped — no OpenGL on this platform)" && true)
@@ -81,37 +66,28 @@ test-syntax:
 
 # ── Verify ───────────────────────────────────────────────────────────────────
 .PHONY: check
-check: inject_jni.dylib cheat_phase2.dylib
-	@for dylib in inject_jni.dylib cheat_phase2.dylib; do \
-		if [ -f "$$dylib" ]; then \
-			echo "==> $$dylib architecture:"; \
-			lipo -info "$$dylib" 2>/dev/null || file "$$dylib"; \
-			echo ""; \
-			echo "==> $$dylib dependencies:"; \
-			otool -L "$$dylib" 2>/dev/null || echo "  (otool not available)"; \
-			echo "---"; \
-		fi; \
-	done
+check: $(DYLIBS)
+	@echo "==> $< architecture:"
+	@lipo -info $< 2>/dev/null || file $<
+	@echo ""
+	@echo "==> $< dependencies:"
+	@otool -L $< 2>/dev/null || echo "  (otool not available)"
 
 # ── Clean ───────────────────────────────────────────────────────────────────
 .PHONY: clean
 clean:
-	rm -f inject_jni.dylib cheat_phase2.dylib
+	rm -f $(DYLIBS)
 	rm -f *.o
 
 # ── Help ────────────────────────────────────────────────────────────────────
-.PHONY: help all
-all: inject_jni.dylib cheat_phase2.dylib sign
-
+.PHONY: help
 help:
 	@echo "Targets:"
-	@echo "  make (or make all)     — build both dylibs + sign"
-	@echo "  make phase1            — build Phase 1 (JNI injection test)"
-	@echo "  make phase2            — build Phase 2 (ESP overlay)"
-	@echo "  make sign              — ad-hoc sign all dylibs"
-	@echo "  make check             — show architecture & dependencies"
-	@echo "  make test-syntax       — compile-only syntax check (CI)"
-	@echo "  make clean             — remove build artifacts"
+	@echo "  make              — build cheat_phase2.dylib + sign"
+	@echo "  make sign         — re-sign the dylib"
+	@echo "  make check        — show architecture & dependencies"
+	@echo "  make test-syntax  — compile-only syntax check (CI)"
+	@echo "  make clean        — remove build artifacts"
 	@echo ""
 	@echo "Variables:"
-	@echo "  JAVA_HOME              — JDK root (default: /opt/homebrew/opt/openjdk@17)"
+	@echo "  JAVA_HOME         — JDK root (default: /opt/homebrew/opt/openjdk@17)"

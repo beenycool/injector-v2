@@ -1,28 +1,16 @@
 #!/bin/bash
-# launch_lunar.sh — Launch Lunar Client 1.8.9 with JNI dylib injection
+# launch_lunar.sh — Launch Lunar Client 1.8.9 with cheat_phase2.dylib
 #
 # Usage:
 #   ./launch_lunar.sh [--no-inject] [additional Lunar args...]
 #
 # Environment variables:
-#   INJECT_DYLIB  — path to the dylib (default: ./inject_jni.dylib)
-#
-# Prerequisites:
-#   - inject_jni.dylib must be built and ad-hoc signed (see Makefile)
-#   - The java binary must have these entitlements:
-#       com.apple.security.cs.allow-dyld-environment-variables = true
-#       com.apple.security.cs.disable-library-validation   = true
+#   CHEAT_DYLIB  — path to the dylib (default: ./cheat_phase2.dylib)
 
 set -euo pipefail
 
-# ── Configuration ───────────────────────────────────────────────────────────
-
 JAVA_BIN="/Users/soodies/.lunarclient/jre/5f250fb4cc79aea565a238c6cc374182dbce30ba/zulu17.64.17-ca-jre17.0.18-macosx_aarch64/zulu-17.jre/Contents/Home/bin/java"
-
-# Path to the injection dylib (override with INJECT_DYLIB env var)
-INJECT_DYLIB="${INJECT_DYLIB:-$(cd "$(dirname "$0")" && pwd)/inject_jni.dylib}"
-
-# ── Argument parsing ────────────────────────────────────────────────────────
+CHEAT_DYLIB="${CHEAT_DYLIB:-$(cd "$(dirname "$0")" && pwd)/cheat_phase2.dylib}"
 
 NO_INJECT=false
 PASSTHROUGH_ARGS=()
@@ -38,41 +26,28 @@ for arg in "$@"; do
     esac
 done
 
-# ── Validation ──────────────────────────────────────────────────────────────
-
 if [ ! -f "$JAVA_BIN" ]; then
     echo "ERROR: Could not find Zulu JRE at $JAVA_BIN"
     exit 1
 fi
 
 if [ "$NO_INJECT" = false ]; then
-    if [ ! -f "$INJECT_DYLIB" ]; then
-        echo "ERROR: Injection dylib not found at $INJECT_DYLIB"
-        echo "  Build it first: make -C $(dirname "$INJECT_DYLIB")"
+    if [ ! -f "$CHEAT_DYLIB" ]; then
+        echo "ERROR: cheat_phase2.dylib not found at $CHEAT_DYLIB"
+        echo "  Build it first: make"
         echo "  Or run with --no-inject to skip injection."
         exit 1
     fi
 fi
 
-# ── Clean up old logs ───────────────────────────────────────────────────────
-
-rm -f /tmp/inject_log.txt /tmp/jni_class_found.txt
-
-# ── Launch ──────────────────────────────────────────────────────────────────
+# Clean up old logs
+rm -f /tmp/phase2_step.txt /tmp/phase2_result.txt
 
 if [ "$NO_INJECT" = false ]; then
-    echo "[*] Launching Lunar Client with JNI injection..."
-    echo "    Dylib: $INJECT_DYLIB"
+    echo "[*] Launching Lunar Client with cheat_phase2.dylib..."
+    echo "    Dylib: $CHEAT_DYLIB"
 
-    # DYLD_INSERT_LIBRARIES tells dyld to load our dylib into the process
-    # at startup.  The dylib's __attribute__((constructor)) runs early, then
-    # a worker thread waits for the JVM to start before doing JNI work.
-    #
-    # DYLD_FORCE_FLAT_NAMESPACE is not strictly required here (we use dlsym
-    # on the handle from dlopen(RTLD_NOLOAD)), but it can help resolve
-    # edge cases with two-level namespaces.  It's safe to include.
-
-    export DYLD_INSERT_LIBRARIES="$INJECT_DYLIB"
+    export DYLD_INSERT_LIBRARIES="$CHEAT_DYLIB"
     export DYLD_FORCE_FLAT_NAMESPACE=1
 
     "$JAVA_BIN" \
@@ -103,28 +78,26 @@ if [ "$NO_INJECT" = false ]; then
       --width 1280 --height 720 \
       "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"
 
-    # After Lunar exits, show the injection results
     echo ""
     echo "[*] Lunar exited. Checking injection results..."
-    if [ -f /tmp/jni_class_found.txt ]; then
-        echo "--- jni_class_found.txt ---"
-        cat /tmp/jni_class_found.txt
+    if [ -f /tmp/phase2_result.txt ]; then
+        echo "--- phase2_result.txt ---"
+        cat /tmp/phase2_result.txt
         echo "--- end ---"
+    else
+        echo "WARNING: /tmp/phase2_result.txt not found! Inject crashed early."
     fi
-    if [ -f /tmp/inject_log.txt ]; then
+    if [ -f /tmp/phase2_step.txt ]; then
         echo ""
-        echo "[*] Full injection log: /tmp/inject_log.txt"
-        echo "    (tail shown below)"
-        echo "--- inject_log.txt (last 20 lines) ---"
-        tail -20 /tmp/inject_log.txt
+        echo "[*] Step log: /tmp/phase2_step.txt"
+        echo "--- phase2_step.txt (last 30 lines) ---"
+        tail -30 /tmp/phase2_step.txt
         echo "--- end ---"
     fi
-
 else
     echo "[*] Launching Lunar Client WITHOUT injection..."
     unset DYLD_INSERT_LIBRARIES
     unset DYLD_FORCE_FLAT_NAMESPACE
-
     "$JAVA_BIN" \
       --add-modules jdk.naming.dns \
       --add-exports jdk.naming.dns/com.sun.jndi.dns=java.naming \
