@@ -591,6 +591,11 @@ static int run_discovery(JNIEnv *env) {
         jobject mc_instance = NULL;
         char tbuf[256];
 
+        /* Max 2 arrays: throwing candidates (skip permanently) and pending (returned null) */
+        #define MAX_PENDING 8
+        struct { char *name; jobject method; } pending[MAX_PENDING];
+        int npending = 0;
+
         for (jsize i = 0; i < mcount; i++) {
             jobject method = (*env)->GetObjectArrayElement(env, methods, i);
             if (!method) continue;
@@ -619,21 +624,92 @@ static int run_discovery(JNIEnv *env) {
             step_log(tbuf);
 
             mc_instance = method_invoke(env, method, NULL, NULL);
-            if (check_exc_quiet(env) || !mc_instance) {
-                /* This one threw (e.g. newInstance() with private ctor) — skip */
-                snprintf(tbuf, sizeof(tbuf), "  %s() threw, skipping", mname ? mname : "?");
+            if (check_exc_quiet(env)) {
+                /* Threw (e.g. newInstance() with private ctor) — skip permanently */
+                snprintf(tbuf, sizeof(tbuf), "  %s() threw, skipping permanently", mname ? mname : "?");
                 step_log(tbuf);
                 free(mname);
                 (*env)->DeleteLocalRef(env, method);
                 continue;
             }
 
-            /* Success! */
+            if (!mc_instance) {
+                /* Returns null — save as pending (singleton not initialized yet) */
+                if (npending < MAX_PENDING) {
+                    pending[npending].name = mname;
+                    pending[npending].method = (*env)->NewGlobalRef(env, method);
+                    npending++;
+                    snprintf(tbuf, sizeof(tbuf), "  %s() returned null — will retry (pending #%d)",
+                             mname ? mname : "?", npending);
+                    step_log(tbuf);
+                } else {
+                    free(mname);
+                }
+                (*env)->DeleteLocalRef(env, method);
+                continue;
+            }
+
+            /* Immediate success! */
             snprintf(tbuf, sizeof(tbuf), "  %s() → %p SUCCESS", mname ? mname : "?", (void *)mc_instance);
             step_log(tbuf);
             getmc_name = mname;
             getmc_method = method;
             break;
+        }
+
+        /* If no immediate success, poll the pending candidates */
+        if (!getmc_method && npending > 0) {
+            step_log("No candidate returned immediately — polling pending methods for singleton initialization...");
+            int poll_count = 0;
+            while (poll_count < 60) {  /* ~30s max */
+                usleep(500000);
+                poll_count++;
+                if (poll_count % 10 == 0) {
+                    snprintf(tbuf, sizeof(tbuf), "  poll attempt %d/60...", poll_count);
+                    step_log(tbuf);
+                }
+
+                for (int p = 0; p < npending; p++) {
+                    jobject result = method_invoke(env, pending[p].method, NULL, NULL);
+                    if (check_exc_quiet(env)) {
+                        /* Now threw? Skip this candidate permanently */
+                        snprintf(tbuf, sizeof(tbuf), "  pending[%d] %s() now threw — removing",
+                                 p, pending[p].name ? pending[p].name : "?");
+                        step_log(tbuf);
+                        (*env)->DeleteLocalRef(env, pending[p].method);
+                        pending[p].method = NULL;
+                        free(pending[p].name);
+                        pending[p].name = NULL;
+                        continue;
+                    }
+                    if (result) {
+                        /* Got it! */
+                        snprintf(tbuf, sizeof(tbuf), "  pending[%d] %s() → %p SUCCESS (after ~%dms)",
+                                 p, pending[p].name ? pending[p].name : "?",
+                                 (void *)result, poll_count * 500);
+                        step_log(tbuf);
+                        getmc_name = pending[p].name; pending[p].name = NULL;
+                        getmc_method = (*env)->NewLocalRef(env, pending[p].method);
+                        mc_instance = result;
+
+                        /* Clean up all pending */
+                        for (int q = 0; q < npending; q++) {
+                            if (pending[q].method) (*env)->DeleteLocalRef(env, pending[q].method);
+                            free(pending[q].name);
+                        }
+                        (*env)->DeleteLocalRef(env, methods);
+                        goto got_mc_method;
+                    }
+                    (*env)->DeleteLocalRef(env, result);
+                }
+            }
+
+            /* Poll timeout — clean up */
+            step_log("Timed out waiting for singleton");
+            for (int p = 0; p < npending; p++) {
+                if (pending[p].method) (*env)->DeleteLocalRef(env, pending[p].method);
+                free(pending[p].name);
+            }
         }
 
         (*env)->DeleteLocalRef(env, methods);
@@ -642,6 +718,7 @@ static int run_discovery(JNIEnv *env) {
             step_log("ERROR: no working getMinecraft() candidate found");
             return -1;
         }
+    got_mc_method: ;
 
         g_disc.mc_instance = (*env)->NewGlobalRef(env, mc_instance);
         {
