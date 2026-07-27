@@ -254,6 +254,9 @@ static JNIEnv *attach_to_jvm(JavaVM *jvm) {
  * Native pthreads have null context classloader, so we enumerate ALL
  * JVM threads and try each one's classloader. This is what Phase 1 did
  * and it works because Lunar sets the classloader on its own threads. */
+/* Class.forName(name, true, loader) — forward declaration */
+static jclass find_class(JNIEnv *env, const char *name, jobject loader);
+
 static jobject get_context_classloader(JNIEnv *env) {
     jclass thread_cls = (*env)->FindClass(env, "java/lang/Thread");
     if (!thread_cls) { step_log("FindClass(java/lang/Thread) FAILED"); check_exc(env); return NULL; }
