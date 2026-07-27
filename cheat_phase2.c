@@ -250,47 +250,74 @@ static JNIEnv *attach_to_jvm(JavaVM *jvm) {
     return env;
 }
 
-/* Get the thread's context classloader (Lunar loads Minecraft classes here,
-   not in the system classloader) */
+/* Find a context classloader that can load Minecraft.
+ * Native pthreads have null context classloader, so we enumerate ALL
+ * JVM threads and try each one's classloader. This is what Phase 1 did
+ * and it works because Lunar sets the classloader on its own threads. */
 static jobject get_context_classloader(JNIEnv *env) {
     jclass thread_cls = (*env)->FindClass(env, "java/lang/Thread");
-    if (!thread_cls) {
-        step_log("FindClass(java/lang/Thread) FAILED");
-        check_exc(env);
-        return NULL;
-    }
-    jmethodID current_mid = (*env)->GetStaticMethodID(env, thread_cls,
-        "currentThread", "()Ljava/lang/Thread;");
-    if (!current_mid) {
-        step_log("GetStaticMethodID(currentThread) FAILED");
-        check_exc(env);
-        (*env)->DeleteLocalRef(env, thread_cls);
-        return NULL;
-    }
-    jobject thread = (*env)->CallStaticObjectMethod(env, thread_cls, current_mid);
-    if (!thread || check_exc(env)) {
-        step_log("currentThread() returned null or threw exception");
-        (*env)->DeleteLocalRef(env, thread_cls);
-        return NULL;
-    }
+    if (!thread_cls) { step_log("FindClass(java/lang/Thread) FAILED"); check_exc(env); return NULL; }
+
+    /* Thread.getAllStackTraces() → Map<Thread, StackTraceElement[]> */
+    jmethodID all_mid = (*env)->GetStaticMethodID(env, thread_cls,
+        "getAllStackTraces", "()Ljava/util/Map;");
+    if (!all_mid) { step_log("getAllStackTraces method not found"); check_exc(env); (*env)->DeleteLocalRef(env, thread_cls); return NULL; }
+    jobject map = (*env)->CallStaticObjectMethod(env, thread_cls, all_mid);
+    if (!map || check_exc(env)) { step_log("getAllStackTraces() failed"); (*env)->DeleteLocalRef(env, thread_cls); return NULL; }
+
+    /* map.keySet() → Set<Thread> */
+    jclass map_cls = (*env)->FindClass(env, "java/util/Map");
+    jmethodID keyset_mid = (*env)->GetMethodID(env, map_cls, "keySet", "()Ljava/util/Set;");
+    jobject key_set = (*env)->CallObjectMethod(env, map, keyset_mid);
+    (*env)->DeleteLocalRef(env, map_cls);
+    if (!key_set || check_exc(env)) { step_log("keySet() failed"); (*env)->DeleteLocalRef(env, map); (*env)->DeleteLocalRef(env, thread_cls); return NULL; }
+
+    /* set.toArray() → Thread[] */
+    jclass set_cls = (*env)->FindClass(env, "java/util/Set");
+    jmethodID toarray_mid = (*env)->GetMethodID(env, set_cls, "toArray", "()[Ljava/lang/Object;");
+    jobjectArray threads = (jobjectArray)(*env)->CallObjectMethod(env, key_set, toarray_mid);
+    (*env)->DeleteLocalRef(env, set_cls);
+    (*env)->DeleteLocalRef(env, key_set);
+    if (!threads || check_exc(env)) { step_log("toArray() failed"); (*env)->DeleteLocalRef(env, map); (*env)->DeleteLocalRef(env, thread_cls); return NULL; }
+
     jmethodID getloader_mid = (*env)->GetMethodID(env, thread_cls,
         "getContextClassLoader", "()Ljava/lang/ClassLoader;");
-    if (!getloader_mid) {
-        step_log("GetMethodID(getContextClassLoader) FAILED");
+    if (!getloader_mid) { step_log("getContextClassLoader method not found"); (*env)->DeleteLocalRef(env, thread_cls); return NULL; }
+
+    jsize n = (*env)->GetArrayLength(env, threads);
+    char lbuf[128];
+    snprintf(lbuf, sizeof(lbuf), "Enumerating %d threads for classloader...", (int)n);
+    step_log(lbuf);
+
+    jobject found_loader = NULL;
+    for (jsize i = 0; i < n; i++) {
+        jobject thread = (*env)->GetObjectArrayElement(env, threads, i);
+        if (!thread) continue;
+        jobject loader = (*env)->CallObjectMethod(env, thread, getloader_mid);
         check_exc(env);
-        (*env)->DeleteLocalRef(env, thread_cls);
-        return NULL;
-    }
-    jobject loader = (*env)->CallObjectMethod(env, thread, getloader_mid);
-    if (check_exc(env) || !loader) {
-        step_log("getContextClassLoader() returned null or threw exception");
+        if (loader != NULL) {
+            /* Try to load Minecraft class with this loader */
+            jclass test = find_class(env, "net.minecraft.client.Minecraft", loader);
+            if (test != NULL) {
+                (*env)->DeleteLocalRef(env, test); /* keep loader, drop class */
+                found_loader = loader;
+                snprintf(lbuf, sizeof(lbuf), "Thread #%d classloader can load Minecraft — using it", (int)i);
+                step_log(lbuf);
+                (*env)->DeleteLocalRef(env, thread);
+                break;
+            }
+            (*env)->DeleteLocalRef(env, loader);
+        }
         (*env)->DeleteLocalRef(env, thread);
-        (*env)->DeleteLocalRef(env, thread_cls);
-        return NULL;
     }
-    (*env)->DeleteLocalRef(env, thread);
+
+    (*env)->DeleteLocalRef(env, map);
     (*env)->DeleteLocalRef(env, thread_cls);
-    return loader;
+    (*env)->DeleteLocalRef(env, threads);
+
+    if (!found_loader)
+        step_log("No thread classloader found that can load Minecraft");
+    return found_loader;
 }
 
 /* Class.forName(name, true, loader) */
