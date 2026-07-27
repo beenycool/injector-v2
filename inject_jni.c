@@ -151,13 +151,48 @@ static jclass find_class_with_thread_loader(JNIEnv *env, const char *name) {
 
     jobject class_loader = (*env)->CallObjectMethod(
         env, current_thread, get_ccl_mid);
-    if (!class_loader || check_and_clear_exception(env)) {
-        log_write("ERROR: CallObjectMethod(getContextClassLoader) failed");
-        (*env)->DeleteLocalRef(env, current_thread);
-        (*env)->DeleteLocalRef(env, thread_cls);
-        return NULL;
+    if (check_and_clear_exception(env)) {
+        log_write("ERROR: CallObjectMethod(getContextClassLoader) threw exception");
+        // Still possible — context classloader might be null even without exception
     }
-    log_write("Got thread context ClassLoader");
+    // getContextClassLoader() may return NULL for native-attached threads.
+    // This is expected JVM behavior. Fall back to system classloader.
+    if (class_loader == NULL) {
+        log_write("WARNING: Thread context classloader is NULL for native-attached thread");
+        log_write("  -> Falling back to ClassLoader.getSystemClassLoader()");
+
+        jclass system_cls = (*env)->FindClass(env, "java/lang/ClassLoader");
+        if (!system_cls || check_and_clear_exception(env)) {
+            log_write("ERROR: FindClass(java/lang/ClassLoader) failed");
+            (*env)->DeleteLocalRef(env, current_thread);
+            (*env)->DeleteLocalRef(env, thread_cls);
+            return NULL;
+        }
+
+        jmethodID get_sys_mid = (*env)->GetStaticMethodID(
+            env, system_cls, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
+        if (!get_sys_mid || check_and_clear_exception(env)) {
+            log_write("ERROR: GetStaticMethodID(getSystemClassLoader) failed");
+            (*env)->DeleteLocalRef(env, system_cls);
+            (*env)->DeleteLocalRef(env, current_thread);
+            (*env)->DeleteLocalRef(env, thread_cls);
+            return NULL;
+        }
+
+        class_loader = (*env)->CallStaticObjectMethod(
+            env, system_cls, get_sys_mid);
+        if (!class_loader || check_and_clear_exception(env)) {
+            log_write("ERROR: CallStaticObjectMethod(getSystemClassLoader) failed");
+            (*env)->DeleteLocalRef(env, system_cls);
+            (*env)->DeleteLocalRef(env, current_thread);
+            (*env)->DeleteLocalRef(env, thread_cls);
+            return NULL;
+        }
+        (*env)->DeleteLocalRef(env, system_cls);
+        log_write("Got system ClassLoader");
+    } else {
+        log_write("Got thread context ClassLoader");
+    }
 
     // 4. java.lang.Class.forName(String, boolean, ClassLoader)
     jclass class_cls = (*env)->FindClass(env, "java/lang/Class");
