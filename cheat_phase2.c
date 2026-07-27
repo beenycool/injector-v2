@@ -167,6 +167,28 @@ static jclass method_return_type(JNIEnv *env, jobject method) {
     return ret;
 }
 
+/* Check if a Method is static via Modifier.isStatic(getModifiers()) */
+static int method_is_static(JNIEnv *env, jobject method) {
+    jclass method_cls = (*env)->GetObjectClass(env, method);
+    if (!method_cls) return 0;
+
+    /* Call method.getModifiers() → int */
+    jmethodID mods_mid = (*env)->GetMethodID(env, method_cls, "getModifiers", "()I");
+    if (!mods_mid) { (*env)->DeleteLocalRef(env, method_cls); return 0; }
+    jint mods = (*env)->CallIntMethod(env, method, mods_mid);
+    (*env)->DeleteLocalRef(env, method_cls);
+
+    /* java.lang.reflect.Modifier.isStatic(mods) → boolean */
+    jclass mod_cls = (*env)->FindClass(env, "java/lang/reflect/Modifier");
+    if (!mod_cls) { check_exc_quiet(env); return 0; }
+    jmethodID is_static_mid = (*env)->GetStaticMethodID(env, mod_cls,
+        "isStatic", "(I)Z");
+    if (!is_static_mid) { (*env)->DeleteLocalRef(env, mod_cls); return 0; }
+    jboolean result = (*env)->CallStaticBooleanMethod(env, mod_cls, is_static_mid, mods);
+    (*env)->DeleteLocalRef(env, mod_cls);
+    return result;
+}
+
 /* Get parameter types of a Method → Class[] */
 static jobjectArray method_param_types(JNIEnv *env, jobject method) {
     jclass method_cls = (*env)->GetObjectClass(env, method);
@@ -541,37 +563,91 @@ static int run_discovery(JNIEnv *env) {
     step_log(mc_name ? mc_name : "Minecraft class found (name unknown)");
     free(mc_name);
 
-    /* --- 2. Discover getMinecraft() static method --- */
+    /* --- 2. Discover getMinecraft() static method ---
+     * Minecraft has multiple static 0-arg methods returning Minecraft:
+     *   newInstance() — deprecated, tries to call private constructor → crashes
+     *   getMinecraft() — the real singleton accessor
+     * We try ALL candidates, skip ones that throw, use the first that works. */
     STEP("Discovering getMinecraft() static method...");
-    const char *getmc_name = NULL;
-    jobject getmc_method = discover_static_0arg_rettype(env, mc_cls, mc_cls, &getmc_name);
-    if (!getmc_method) {
-        step_log("ERROR: could not discover getMinecraft() method");
-        return -1;
-    }
-
-    /* Invoke it */
-    jobject mc_instance = method_invoke(env, getmc_method, NULL, NULL);
-    if (!mc_instance) {
-        step_log("ERROR: getMinecraft() invocation returned null");
-        (*env)->DeleteLocalRef(env, getmc_method);
-        return -1;
-    }
-    g_disc.mc_instance = (*env)->NewGlobalRef(env, mc_instance);
     {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "getMinecraft() = %p (method name: %s)",
-                 (void *)mc_instance, getmc_name ? getmc_name : "?");
-        step_log(buf);
-    }
-    step_log(getmc_name ? getmc_name : "getMinecraft name unknown");
+        jobjectArray methods = get_declared_methods(env, mc_cls);
+        if (!methods) { step_log("ERROR: getDeclaredMethods() failed"); return -1; }
+        jsize mcount = (*env)->GetArrayLength(env, methods);
+        char *getmc_name = NULL;
+        jobject getmc_method = NULL;
+        jobject mc_instance = NULL;
+        char tbuf[256];
 
-    /* Build the JNI method ID for future direct calls */
-    jclass mc_inst_cls = (*env)->GetObjectClass(env, mc_instance);
-    g_disc.getMinecraft_mid = (*env)->GetStaticMethodID(
-        env, mc_inst_cls, getmc_name, "()Lnet/minecraft/client/Minecraft;");
-    (*env)->DeleteLocalRef(env, mc_inst_cls);
-    free((void *)getmc_name);
+        for (jsize i = 0; i < mcount; i++) {
+            jobject method = (*env)->GetObjectArrayElement(env, methods, i);
+            if (!method) continue;
+
+            /* Check static */
+            int is_static = method_is_static(env, method);
+            if (!is_static) { (*env)->DeleteLocalRef(env, method); continue; }
+
+            /* Check return type matches Minecraft */
+            jclass ret = method_return_type(env, method);
+            if (!ret) { (*env)->DeleteLocalRef(env, method); continue; }
+            int match = (*env)->IsSameObject(env, ret, mc_cls);
+            (*env)->DeleteLocalRef(env, ret);
+            if (!match) { (*env)->DeleteLocalRef(env, method); continue; }
+
+            /* Check 0 parameters */
+            jobjectArray params = method_param_types(env, method);
+            if (!params) { (*env)->DeleteLocalRef(env, method); continue; }
+            jsize pcount = (*env)->GetArrayLength(env, params);
+            (*env)->DeleteLocalRef(env, params);
+            if (pcount != 0) { (*env)->DeleteLocalRef(env, method); continue; }
+
+            /* Candidate found — try invoking it */
+            char *mname = get_member_name(env, method);
+            snprintf(tbuf, sizeof(tbuf), "  Trying: %s()...", mname ? mname : "?");
+            step_log(tbuf);
+
+            mc_instance = method_invoke(env, method, NULL, NULL);
+            if (check_exc_quiet(env) || !mc_instance) {
+                /* This one threw (e.g. newInstance() with private ctor) — skip */
+                snprintf(tbuf, sizeof(tbuf), "  %s() threw, skipping", mname ? mname : "?");
+                step_log(tbuf);
+                free(mname);
+                (*env)->DeleteLocalRef(env, method);
+                continue;
+            }
+
+            /* Success! */
+            snprintf(tbuf, sizeof(tbuf), "  %s() → %p SUCCESS", mname ? mname : "?", (void *)mc_instance);
+            step_log(tbuf);
+            getmc_name = mname;
+            getmc_method = method;
+            break;
+        }
+
+        (*env)->DeleteLocalRef(env, methods);
+
+        if (!getmc_method) {
+            step_log("ERROR: no working getMinecraft() candidate found");
+            return -1;
+        }
+
+        g_disc.mc_instance = (*env)->NewGlobalRef(env, mc_instance);
+        {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "getMinecraft() = %p (method name: %s)",
+                     (void *)mc_instance, getmc_name ? getmc_name : "?");
+            step_log(buf);
+        }
+
+        /* Build the JNI method ID for future direct calls */
+        jclass mc_inst_cls = (*env)->GetObjectClass(env, mc_instance);
+        g_disc.getMinecraft_mid = (*env)->GetStaticMethodID(
+            env, mc_inst_cls, getmc_name, "()Lnet/minecraft/client/Minecraft;");
+        (*env)->DeleteLocalRef(env, mc_inst_cls);
+
+        (*env)->DeleteLocalRef(env, getmc_method);
+        (*env)->DeleteLocalRef(env, mc_instance);
+        free(getmc_name);
+    }
     (*env)->DeleteLocalRef(env, getmc_method);
 
     /* --- 3. Find World class --- */
