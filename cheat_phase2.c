@@ -281,6 +281,23 @@ static char *class_get_name(JNIEnv *env, jclass cls) {
     return result;
 }
 
+/* Convert a dotted class name to JNI descriptor: "net.minecraft.world.World" → "Lnet/minecraft/world/World;" */
+static char *class_to_descriptor(const char *dotted) {
+    if (!dotted) return NULL;
+    size_t len = strlen(dotted);
+    char *desc = malloc(len + 3);
+    if (!desc) return NULL;
+    desc[0] = 'L';
+    memcpy(desc + 1, dotted, len);
+    desc[len + 1] = ';';
+    desc[len + 2] = '\0';
+    /* Convert dots to slashes */
+    for (char *p = desc + 1; *p && *p != ';'; p++) {
+        if (*p == '.') *p = '/';
+    }
+    return desc;
+}
+
 /* Attach current native thread to JVM */
 static JNIEnv *attach_to_jvm(JavaVM *jvm) {
     JNIEnv *env = NULL;
@@ -485,7 +502,8 @@ static jobject discover_static_0arg_rettype(JNIEnv *env, jclass cls,
 /* Find a field whose type matches target_type_cls. Returns Field object. */
 static jobject discover_field_by_type(JNIEnv *env, jclass cls,
                                        jclass target_type_cls,
-                                       const char **out_name) {
+                                       const char **out_name,
+                                       char **out_type_name) {
     jobjectArray fields = get_declared_fields(env, cls);
     if (!fields) return NULL;
     jsize n = (*env)->GetArrayLength(env, fields);
@@ -506,10 +524,15 @@ static jobject discover_field_by_type(JNIEnv *env, jclass cls,
             continue;
         }
         char *name = get_member_name(env, field);
+        /* Get the actual field type's class name for JNI descriptor */
+        jclass ft2 = field_type(env, field);
+        char *type_name = ft2 ? class_get_name(env, ft2) : NULL;
+        if (ft2) (*env)->DeleteLocalRef(env, ft2);
         snprintf(lbuf, sizeof(lbuf),
-                 "  Discovered field: %s (type match)", name ? name : "(null)");
+                 "  Discovered field: %s (type: %s)", name ? name : "(null)", type_name ? type_name : "?");
         step_log(lbuf);
         if (out_name) *out_name = name;
+        if (out_type_name) *out_type_name = type_name; else free(type_name);
         (*env)->DeleteLocalRef(env, fields);
         return field; /* caller must DeleteLocalRef */
     }
@@ -748,7 +771,8 @@ static int run_discovery(JNIEnv *env) {
     /* --- 4. Discover theWorld field --- */
     STEP("Discovering theWorld field (type World)...");
     const char *world_fname = NULL;
-    jobject world_field = discover_field_by_type(env, mc_cls, world_cls, &world_fname);
+    char *world_type_name = NULL;
+    jobject world_field = discover_field_by_type(env, mc_cls, world_cls, &world_fname, &world_type_name);
     if (!world_field) {
         step_log("ERROR: could not discover theWorld field");
         return -1;
@@ -760,10 +784,14 @@ static int run_discovery(JNIEnv *env) {
         (*env)->DeleteLocalRef(env, world_field);
         return -1;
     }
-    g_disc.theWorld_fid = (*env)->GetFieldID(env, mc_cls, world_fname,
-                                              "Lnet/minecraft/world/World;");
+    /* Build JNI field ID using the ACTUAL field type, not the target type */
+    char *world_desc = world_type_name ? class_to_descriptor(world_type_name) : NULL;
+    if (!world_desc) { step_log("ERROR: could not build theWorld descriptor"); free((void *)world_fname); free(world_type_name); (*env)->DeleteLocalRef(env, world_field); (*env)->DeleteLocalRef(env, theWorld); return -1; }
+    g_disc.theWorld_fid = (*env)->GetFieldID(env, mc_cls, world_fname, world_desc);
+    free(world_desc);
     (*env)->DeleteLocalRef(env, theWorld); /* will re-get each frame */
     free((void *)world_fname);
+    free(world_type_name);
     (*env)->DeleteLocalRef(env, world_field);
     step_log("theWorld discovered successfully");
 
@@ -775,12 +803,21 @@ static int run_discovery(JNIEnv *env) {
     } else {
         g_disc.entityplayer_class = (jclass)(*env)->NewGlobalRef(env, ep_cls);
         const char *player_fname = NULL;
-        jobject player_field = discover_field_by_type(env, mc_cls, ep_cls, &player_fname);
+        char *player_type_name = NULL;
+        jobject player_field = discover_field_by_type(env, mc_cls, ep_cls, &player_fname, &player_type_name);
         if (player_field) {
             set_accessible(env, player_field);
-            g_disc.thePlayer_fid = (*env)->GetFieldID(env, mc_cls, player_fname,
-                "Lnet/minecraft/entity/player/EntityPlayer;");
+            char *player_desc = player_type_name ? class_to_descriptor(player_type_name) : NULL;
+            if (!player_desc) {
+                step_log("WARNING: could not build thePlayer descriptor, using hardcoded sig");
+                g_disc.thePlayer_fid = (*env)->GetFieldID(env, mc_cls, player_fname,
+                    "Lnet/minecraft/entity/player/EntityPlayer;");
+            } else {
+                g_disc.thePlayer_fid = (*env)->GetFieldID(env, mc_cls, player_fname, player_desc);
+                free(player_desc);
+            }
             free((void *)player_fname);
+            free(player_type_name);
             (*env)->DeleteLocalRef(env, player_field);
             step_log("thePlayer discovered successfully");
         } else {
